@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "r2d2-pytorch"
+version = "0.1.0"
+description = ""
+authors = ["hungmanh21 <hungmanh211103@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+torch = {version = "^2.5.1+cu118", source = "pytorch-gpu"}
+torchvision = {version = "^0.20.1+cu118", source = "pytorch-gpu"}
+torchaudio = {version = "^2.5.1+cu118", source = "pytorch-gpu"}
+
+
+[[tool.poetry.source]]
+name = "pytorch-gpu"
+url = "https://download.pytorch.org/whl/cu118"
+priority = "explicit"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
