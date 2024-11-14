@@ -394,3 +394,7 @@ def main():
             best_threshold = trainer.test(is_dev_environment=True)
             trainer.test(is_dev_environment=False,
                          best_threshold=best_threshold)
+
+
+if __name__ == '__main__':
+    main()
