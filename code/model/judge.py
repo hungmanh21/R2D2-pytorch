@@ -43,8 +43,8 @@ class Judge(nn.Module):
 
         self.train_entities = params['train_entity_embeddings']
         self.train_relations = params['train_relation_embeddings']
-        self.entity_embeddings.weight.requires_grad = self.train_entities
-        self.relation_embeddings.weight.requires_grad = self.train_relations
+        self.entity_embeddings.weight.requires_grad = True if self.train_entities else False
+        self.relation_embeddings.weight.requires_grad = True if self.train_relations else False
 
         # Define MLP layers
         self.mlp = nn.ModuleList()
