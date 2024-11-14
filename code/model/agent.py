@@ -168,20 +168,20 @@ class Agent(nn.Module):
         self.query_object_embedding_agent_2 = self.entity_lookup_table_agent_2(
             query_object)
 
-        def get_initial_state(self, batch_size):
-            """
-            Initializes the LSTM states as a list of tuples (h, c) for each layer, with the correct dimensions.
-            """
-            initial_state = [
-                (
-                    torch.zeros(batch_size, self.m *
-                                self.embedding_size, device=self.device),
-                    torch.zeros(batch_size, self.m *
-                                self.embedding_size, device=self.device)
-                )
-                for _ in range(self.hidden_layers)
-            ]
-            return initial_state
+    def get_initial_state(self, batch_size):
+        """
+        Initializes the LSTM states as a list of tuples (h, c) for each layer, with the correct dimensions.
+        """
+        initial_state = [
+            (
+                torch.zeros(batch_size, self.m *
+                            self.embedding_size, device=self.device),
+                torch.zeros(batch_size, self.m *
+                            self.embedding_size, device=self.device)
+            )
+            for _ in range(self.hidden_layers)
+        ]
+        return initial_state
 
     def policy(self, input_action, which_agent):
         """
