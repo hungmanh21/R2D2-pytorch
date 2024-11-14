@@ -209,6 +209,15 @@ class Agent(nn.Module):
         '''
         Computes a step for an agent during the debate.
         '''
+        current_entities = torch.tensor(current_entities, dtype=torch.long, device=self.device) \
+            if not isinstance(current_entities, torch.Tensor) else current_entities
+        prev_relation = torch.tensor(prev_relation, dtype=torch.long, device=self.device) \
+            if not isinstance(prev_relation, torch.Tensor) else prev_relation
+        next_relations = torch.tensor(next_relations, dtype=torch.long, device=self.device) \
+            if not isinstance(next_relations, torch.Tensor) else next_relations
+        next_entities = torch.tensor(next_entities, dtype=torch.long, device=self.device) \
+            if not isinstance(next_entities, torch.Tensor) else next_entities
+
         self.state_agent_1 = prev_state_agent_1
         self.state_agent_2 = prev_state_agent_2
 
