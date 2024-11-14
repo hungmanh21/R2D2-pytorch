@@ -207,6 +207,8 @@ class Agent(nn.Module):
 
         # Process the input action through each LSTM layer
         for i, lstm in enumerate(lstm_cells):
+            print(f"Layer {i} state: {current_state[i]}")
+            h, c = current_state[i]  # Unpack as usual
             h, c = current_state[i]
             h, c = lstm(current_input, (h, c))
             next_states.append((h, c))
