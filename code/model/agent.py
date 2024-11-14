@@ -231,6 +231,13 @@ class Agent(nn.Module):
             prev_relation_emb = self.relation_lookup_table_agent_2(
                 prev_relation)
 
+        if prev_entity.dim() == 1:
+            prev_entity = prev_entity.unsqueeze(0)  # Add batch dimension
+
+        if prev_relation_emb.dim() == 1:
+            prev_relation_emb = prev_relation_emb.unsqueeze(
+                0)  # Add batch dimension
+
         if self.use_entity_embeddings:
             state = torch.cat([prev_relation_emb, prev_entity], dim=-1)
         else:
