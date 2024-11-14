@@ -178,12 +178,15 @@ class Agent(nn.Module):
             if not self.state_agent_1:
                 self.state_agent_1 = self.get_init_state_array(
                     input_action.size(0))
+                print("agent1")
             current_state = self.state_agent_1
+
         else:
             lstm_cells = self.policy_agent_2
             if not self.state_agent_2:
                 self.state_agent_2 = self.get_init_state_array(
                     input_action.size(0))
+                print("agent2")
             current_state = self.state_agent_2
 
         # Initialize `next_states` list to collect new states for each layer
