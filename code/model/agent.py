@@ -204,11 +204,18 @@ class Agent(nn.Module):
             self.query_object_embedding_agent_2 = self.entity_lookup_table_agent_2(
                 query_object)
 
-    def step(self, next_relations, next_entities, prev_state_agent_1,
-             prev_state_agent_2, prev_relation, current_entities, range_arr, which_agent, random_flag):
-        '''
-        Computes a step for an agent during the debate.
-        '''
+    import torch
+
+
+class Agent(nn.Module):
+    # Assuming initialization and other functions are here as given
+
+    def step(self, next_relations, next_entities, prev_state_agent_1, prev_state_agent_2,
+             prev_relation, current_entities, range_arr, which_agent, random_flag):
+        """
+        Computes a step for an agent during the debate, ensuring dimension compatibility for concatenation.
+        """
+        # Convert inputs to tensors if they aren't already
         current_entities = torch.tensor(current_entities, dtype=torch.long, device=self.device) \
             if not isinstance(current_entities, torch.Tensor) else current_entities
         prev_relation = torch.tensor(prev_relation, dtype=torch.long, device=self.device) \
@@ -218,10 +225,11 @@ class Agent(nn.Module):
         next_entities = torch.tensor(next_entities, dtype=torch.long, device=self.device) \
             if not isinstance(next_entities, torch.Tensor) else next_entities
 
+        # Initialize agent states
         self.state_agent_1 = prev_state_agent_1
         self.state_agent_2 = prev_state_agent_2
 
-        # Get state vector
+        # Retrieve embeddings for `prev_relation` and `current_entities` based on the agent
         if which_agent == 0:
             prev_entity = self.entity_lookup_table_agent_1(current_entities)
             prev_relation_emb = self.relation_lookup_table_agent_1(
@@ -231,19 +239,19 @@ class Agent(nn.Module):
             prev_relation_emb = self.relation_lookup_table_agent_2(
                 prev_relation)
 
+        # Ensure both `prev_entity` and `prev_relation_emb` have the same batch dimension for concatenation
         if prev_entity.dim() == 1:
-            prev_entity = prev_entity.unsqueeze(0)  # Add batch dimension
-
+            prev_entity = prev_entity.unsqueeze(
+                0)  # Add batch dimension if missing
         if prev_relation_emb.dim() == 1:
             prev_relation_emb = prev_relation_emb.unsqueeze(
-                0)  # Add batch dimension
+                0)  # Add batch dimension if missing
 
-        if self.use_entity_embeddings:
-            state = torch.cat([prev_relation_emb, prev_entity], dim=-1)
-        else:
-            state = prev_relation_emb
+        # Concatenate relation and entity embeddings as state vector
+        state = torch.cat([prev_relation_emb, prev_entity], dim=-1) if prev_entity.size(0) == prev_relation_emb.size(0) \
+            else prev_relation_emb.repeat(prev_entity.size(0), 1)
 
-        # Get query embeddings based on agent
+        # Retrieve query embeddings for the agent
         if which_agent == 0:
             query_subject_embedding = self.query_subject_embedding_agent_1
             query_relation_embedding = self.query_relation_embedding_agent_1
@@ -253,9 +261,9 @@ class Agent(nn.Module):
             query_relation_embedding = self.query_relation_embedding_agent_2
             query_object_embedding = self.query_object_embedding_agent_2
 
-        state_query_concat = torch.cat([
-            state, query_subject_embedding, query_relation_embedding, query_object_embedding
-        ], dim=-1)
+        # Concatenate state and query embeddings
+        state_query_concat = torch.cat(
+            [state, query_subject_embedding, query_relation_embedding, query_object_embedding], dim=-1)
 
         # Get action embeddings and scores
         candidate_action_embeddings = self.action_encoder_agent(
@@ -265,14 +273,14 @@ class Agent(nn.Module):
         prelim_scores = torch.sum(
             candidate_action_embeddings * output_expanded, dim=2)
 
-        # Mask PAD actions
+        # Mask PAD actions and calculate scores
         mask = (next_relations == self.rPAD)
         scores = torch.where(mask, torch.ones_like(
             prelim_scores) * -99999.0, prelim_scores)
         uni_scores = torch.where(mask, torch.ones_like(
             prelim_scores) * -99999.0, torch.ones_like(prelim_scores))
 
-        # Sample action
+        # Sample action based on scores
         if random_flag:
             action = torch.multinomial(torch.softmax(uni_scores, dim=-1), 1)
         else:
