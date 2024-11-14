@@ -1,8 +1,3 @@
-import json
-from sklearn.model_selection import ParameterGrid
-from pprint import pprint
-import datetime
-import uuid
 import os
 import torch
 import torch.nn as nn
@@ -10,7 +5,10 @@ import torch.optim as optim
 import numpy as np
 import logging
 import random
+from sklearn.model_selection import ParameterGrid
+from pprint import pprint
 
+# Assuming `agent.py` and `judge.py` files have been modified for compatibility
 from code.model.judge import Judge
 from code.model.agent import Agent
 from code.options import read_options
@@ -18,13 +16,13 @@ from code.model.environment import env
 from code.model.baseline import ReactiveBaseline
 from code.model.debate_printer import Debate_Printer
 
-logger = logging.getLogger()
+# Configure logging
 logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger()
 
 
 class Trainer:
     def __init__(self, params, best_metric):
-        # Transfer parameters to self
         for key, val in params.items():
             setattr(self, key, val)
 
@@ -39,12 +37,14 @@ class Trainer:
         self.number_steps = self.path_length * self.number_arguments * 2
         self.best_metric = best_metric
 
+        # Optimizers for judge and agents
         self.learning_rate_judge = params['learning_rate_judge']
         self.optimizer_judge = optim.Adam(
             self.judge.parameters(), lr=self.learning_rate_judge)
         self.optimizer_agents = optim.Adam(
             self.agent.parameters(), lr=self.learning_rate_agents)
 
+        # Baseline models for REINFORCE loss
         self.baseline_1 = ReactiveBaseline(l=self.Lambda)
         self.baseline_2 = ReactiveBaseline(l=self.Lambda)
 
@@ -55,7 +55,7 @@ class Trainer:
             torch.manual_seed(seed)
 
     def calc_reinforce_loss(self, per_example_loss, which_agent_sequence, rewards, entropy_reg_coeff):
-        loss = torch.stack(per_example_loss, dim=1)  # [B, T]
+        loss = torch.stack(per_example_loss, dim=1)
         mask = torch.tensor(which_agent_sequence).bool()
         mask = mask.repeat(loss.size(0), 1)
         not_mask = ~mask
@@ -68,7 +68,6 @@ class Trainer:
         final_reward_2 = rewards["reward_2"] - \
             self.baseline_2.get_baseline_value()
 
-        # Normalize rewards
         final_reward_1 = (final_reward_1 - final_reward_1.mean()
                           ) / (final_reward_1.std() + 1e-6)
         final_reward_2 = (final_reward_2 - final_reward_2.mean()
@@ -85,7 +84,7 @@ class Trainer:
         return total_loss_1, total_loss_2
 
     def entropy_reg_loss(self, all_logits):
-        all_logits = torch.stack(all_logits, dim=2)  # [B, MAX_NUM_ACTIONS, T]
+        all_logits = torch.stack(all_logits, dim=2)
         mask = torch.tensor(self.which_agent_sequence).bool()
         not_mask = ~mask
 
@@ -102,39 +101,30 @@ class Trainer:
         return entropy_policy_1, entropy_policy_2
 
     def train(self):
-        """
-        Trains the model using the environment, agent, and judge.
-        """
         self.agent.train()
         self.judge.train()
         self.batch_counter = 0
-
-        # Initialize debate printer for debugging or logging
         debate_printer = Debate_Printer(
-            self.output_dir, self.train_environment.grapher, self.num_rollouts
-        )
+            self.output_dir, self.train_environment.grapher, self.num_rollouts)
 
         for episode in self.train_environment.get_episodes():
-            # Decide whether to train the judge or the agent
             is_train_judge = (self.batch_counter // self.train_judge_every) % 2 == 0 \
                 or self.batch_counter >= self.rounds_sub_training
 
-            logger.info(f"BATCH COUNTER: {self.batch_counter}")
             self.batch_counter += 1
 
-            # Fetch query and labels from the episode
             query_subjects = episode.get_query_subjects()
             query_relation = episode.get_query_relation()
             query_objects = episode.get_query_objects()
             labels = episode.get_labels()
 
-            # Set embeddings in agent and judge
+            # Set query embeddings
             self.agent.set_query_embeddings(
                 query_subjects, query_relation, query_objects)
             self.judge.set_query_embeddings(
                 query_subjects, query_relation, query_objects)
 
-            # Run the agent to generate actions and logits
+            # Run agent
             loss_judge, final_logit_judge, _, per_example_loss, per_example_logits, action_idx, rewards_agents, _ = \
                 self.agent(
                     which_agent=[0.0] * (self.number_steps // 2) +
@@ -148,7 +138,6 @@ class Trainer:
                     random_flag=False,
                 )
 
-            # Train judge or agent based on the batch count
             if is_train_judge:
                 self.optimizer_judge.zero_grad()
                 loss_judge.backward()
@@ -165,54 +154,42 @@ class Trainer:
                     },
                     entropy_reg_coeff=self.decaying_beta,
                 )
-
                 self.optimizer_agents.zero_grad()
                 (loss_1 + loss_2).backward()
                 self.optimizer_agents.step()
 
-            # Evaluate model periodically
             if self.batch_counter % self.eval_every == 0:
                 self.test(is_dev_environment=True)
 
     def test(self, is_dev_environment):
-        """
-        Tests the model using the environment and computes metrics.
-        """
         self.agent.eval()
         self.judge.eval()
-
-        # Select appropriate environment
         environment = self.dev_test_environment if is_dev_environment else self.test_test_environment
         debate_printer = Debate_Printer(
-            self.output_dir, self.train_environment.grapher, self.test_rollouts, is_append=True
-        )
+            self.output_dir, self.train_environment.grapher, self.test_rollouts, is_append=True)
 
-        # Initialize metrics
         hits_at_1, hits_at_3, hits_at_10, hits_at_20 = 0, 0, 0, 0
         mean_reciprocal_rank, total_examples = 0, 0
 
         for episode in environment.get_episodes():
-            # Fetch query and labels
             query_subjects = episode.get_query_subjects()
             query_relation = episode.get_query_relation()
             query_objects = episode.get_query_objects()
             labels = episode.get_labels()
 
-            # Set embeddings in agent and judge
             self.agent.set_query_embeddings(
                 query_subjects, query_relation, query_objects)
             self.judge.set_query_embeddings(
                 query_subjects, query_relation, query_objects)
 
-            # Run the agent for predictions
             logits, _, _, _, _, action_idx, _, _ = self.agent(
                 which_agent=[0.0] * (self.number_steps // 2) +
                 [1.0] * (self.number_steps // 2),
                 candidate_relation_sequence=episode.state["next_relations"],
                 candidate_entity_sequence=episode.state["next_entities"],
                 current_entities=episode.state["current_entities"],
-                range_arr=torch.arange(episode.no_examples,
-                                       device=self.agent.device),
+                range_arr=torch.arange(
+                    episode.no_examples, device=self.agent.device),
                 T=self.number_steps,
                 random_flag=False,
             )
@@ -220,18 +197,15 @@ class Trainer:
             logits = logits.detach()
             predictions = torch.sigmoid(logits).squeeze().round()
 
-            # Calculate metrics
             hits_at_1 += (predictions == labels).sum().item()
             total_examples += len(labels)
 
-            # Compute additional metrics like Hits@3, Hits@10, and MRR
             ranks = torch.argsort(torch.argsort(-logits, dim=0), dim=0) + 1
             mean_reciprocal_rank += (1 / ranks).sum().item()
             hits_at_3 += (ranks <= 3).sum().item()
             hits_at_10 += (ranks <= 10).sum().item()
             hits_at_20 += (ranks <= 20).sum().item()
 
-        # Log metrics
         logger.info(f"Hits@1: {hits_at_1 / total_examples:.4f}")
         logger.info(f"Hits@3: {hits_at_3 / total_examples:.4f}")
         logger.info(f"Hits@10: {hits_at_10 / total_examples:.4f}")
