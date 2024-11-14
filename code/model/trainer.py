@@ -1,5 +1,4 @@
 import json
-from trainer import Trainer  # Assuming Trainer is defined as shown previously
 from sklearn.model_selection import ParameterGrid
 from pprint import pprint
 import datetime
