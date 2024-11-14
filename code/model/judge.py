@@ -46,6 +46,9 @@ class Judge(nn.Module):
         self.entity_embeddings.weight.requires_grad = True if self.train_entities else False
         self.relation_embeddings.weight.requires_grad = True if self.train_relations else False
 
+        self.device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
+
         # Define MLP layers
         self.mlp = nn.ModuleList()
         for i in range(self.hidden_layers):
@@ -140,6 +143,13 @@ class Judge(nn.Module):
         """
         Sets the judge's query information.
         """
+        query_subject = torch.tensor(
+            query_subject, dtype=torch.long, device=self.device)
+        query_relation = torch.tensor(
+            query_relation, dtype=torch.long, device=self.device)
+        query_object = torch.tensor(
+            query_object, dtype=torch.long, device=self.device)
+
         self.query_subject_embedding = self.entity_embeddings(query_subject)
         self.query_relation_embedding = self.relation_embeddings(
             query_relation)
