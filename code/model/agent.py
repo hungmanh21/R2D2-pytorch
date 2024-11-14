@@ -121,37 +121,6 @@ class Agent(nn.Module):
             (mem_agent[0], mem_agent[1], temp_batch_size * self.test_rollouts, mem_agent[3])).astype('float32')
         return torch.FloatTensor(agent_mem_1).to(self.device), torch.FloatTensor(agent_mem_2).to(self.device)
 
-    def policy(self, input_action, which_agent):
-        '''
-        Processes input through the appropriate agent's LSTM policy.
-        '''
-        if which_agent == 0:
-            lstm_cells = self.policy_agent_1
-            current_state = self.state_agent_1
-        else:
-            lstm_cells = self.policy_agent_2
-            current_state = self.state_agent_2
-
-        # Process through LSTM layers
-        h, c = current_state[0]
-        next_states = []
-        current_input = input_action
-
-        for i, lstm in enumerate(lstm_cells):
-            h, c = lstm(current_input, (h, c))
-            next_states.append((h, c))
-            current_input = h
-
-        # Update states
-        if which_agent == 0:
-            self.state_agent_1 = next_states
-            self.state_agent_2 = self.state_agent_2
-        else:
-            self.state_agent_1 = self.state_agent_1
-            self.state_agent_2 = next_states
-
-        return h
-
     def action_encoder_agent(self, next_relations, current_entities, which_agent):
         '''
         Encodes available actions for an agent.
@@ -176,15 +145,13 @@ class Agent(nn.Module):
         return action_embedding
 
     def set_query_embeddings(self, query_subject, query_relation, query_object):
-        '''
-        Sets query embeddings for both agents.
-        '''
-        query_subject = torch.tensor(
-            query_subject, dtype=torch.long, device=self.device)
-        query_relation = torch.tensor(
-            query_relation, dtype=torch.long, device=self.device)
-        query_object = torch.tensor(
-            query_object, dtype=torch.long, device=self.device)
+        """
+        Sets query embeddings for both agents, using clone().detach() to avoid warnings.
+        """
+        # Ensure inputs are PyTorch tensors and clone().detach() to avoid warnings
+        query_subject = query_subject.clone().detach()
+        query_relation = query_relation.clone().detach()
+        query_object = query_object.clone().detach()
 
         # Set embeddings for both agents
         self.query_subject_embedding_agent_1 = self.entity_lookup_table_agent_1(
@@ -200,6 +167,44 @@ class Agent(nn.Module):
             query_relation)
         self.query_object_embedding_agent_2 = self.entity_lookup_table_agent_2(
             query_object)
+
+    def policy(self, input_action, which_agent):
+        """
+        Processes input through the appropriate agent's LSTM policy, with proper state initialization.
+        """
+        # Select LSTM cells and current state for the agent
+        if which_agent == 0:
+            lstm_cells = self.policy_agent_1
+            current_state = self.state_agent_1
+        else:
+            lstm_cells = self.policy_agent_2
+            current_state = self.state_agent_2
+
+        # Properly initialize `current_state` if it's empty
+        if not current_state:
+            # Get the batch size from input action
+            temp_batch_size = input_action.size(0)
+            initial_state = torch.zeros(
+                self.hidden_layers, temp_batch_size, self.m * self.embedding_size, device=self.device)
+            current_state = [(initial_state, initial_state)
+                             for _ in range(self.hidden_layers)]
+
+        # Process input through LSTM layers
+        next_states = []
+        current_input = input_action
+        for i, lstm in enumerate(lstm_cells):
+            h, c = current_state[i]
+            h, c = lstm(current_input, (h, c))
+            next_states.append((h, c))
+            current_input = h
+
+        # Update states
+        if which_agent == 0:
+            self.state_agent_1 = next_states
+        else:
+            self.state_agent_2 = next_states
+
+        return h
 
     def step(self, next_relations, next_entities, prev_state_agent_1, prev_state_agent_2,
              prev_relation, current_entities, range_arr, which_agent, random_flag):

@@ -143,13 +143,11 @@ class Judge(nn.Module):
         """
         Sets the judge's query information.
         """
-        query_subject = torch.tensor(
-            query_subject, dtype=torch.long, device=self.device)
-        query_relation = torch.tensor(
-            query_relation, dtype=torch.long, device=self.device)
-        query_object = torch.tensor(
-            query_object, dtype=torch.long, device=self.device)
+        query_subject = query_subject.clone().detach()
+        query_relation = query_relation.clone().detach()
+        query_object = query_object.clone().detach()
 
+        # Set embeddings for the query
         self.query_subject_embedding = self.entity_embeddings(query_subject)
         self.query_relation_embedding = self.relation_embeddings(
             query_relation)
