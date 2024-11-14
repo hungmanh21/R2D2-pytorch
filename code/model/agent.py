@@ -179,36 +179,27 @@ class Agent(nn.Module):
         '''
         Sets query embeddings for both agents.
         '''
+        query_subject = torch.tensor(
+            query_subject, dtype=torch.long, device=self.device)
+        query_relation = torch.tensor(
+            query_relation, dtype=torch.long, device=self.device)
+        query_object = torch.tensor(
+            query_object, dtype=torch.long, device=self.device)
 
-        def set_query_embeddings(self, query_subject, query_relation, query_object):
-            # Ensure inputs are PyTorch tensors
-            query_subject = torch.tensor(
-                query_subject, dtype=torch.long, device=self.device)
-            query_relation = torch.tensor(
-                query_relation, dtype=torch.long, device=self.device)
-            query_object = torch.tensor(
-                query_object, dtype=torch.long, device=self.device)
+        # Set embeddings for both agents
+        self.query_subject_embedding_agent_1 = self.entity_lookup_table_agent_1(
+            query_subject)
+        self.query_relation_embedding_agent_1 = self.relation_lookup_table_agent_1(
+            query_relation)
+        self.query_object_embedding_agent_1 = self.entity_lookup_table_agent_1(
+            query_object)
 
-            # Set embeddings for both agents
-            self.query_subject_embedding_agent_1 = self.entity_lookup_table_agent_1(
-                query_subject)
-            self.query_relation_embedding_agent_1 = self.relation_lookup_table_agent_1(
-                query_relation)
-            self.query_object_embedding_agent_1 = self.entity_lookup_table_agent_1(
-                query_object)
-
-            self.query_subject_embedding_agent_2 = self.entity_lookup_table_agent_2(
-                query_subject)
-            self.query_relation_embedding_agent_2 = self.relation_lookup_table_agent_2(
-                query_relation)
-            self.query_object_embedding_agent_2 = self.entity_lookup_table_agent_2(
-                query_object)
-
-    import torch
-
-
-class Agent(nn.Module):
-    # Assuming initialization and other functions are here as given
+        self.query_subject_embedding_agent_2 = self.entity_lookup_table_agent_2(
+            query_subject)
+        self.query_relation_embedding_agent_2 = self.relation_lookup_table_agent_2(
+            query_relation)
+        self.query_object_embedding_agent_2 = self.entity_lookup_table_agent_2(
+            query_object)
 
     def step(self, next_relations, next_entities, prev_state_agent_1, prev_state_agent_2,
              prev_relation, current_entities, range_arr, which_agent, random_flag):
