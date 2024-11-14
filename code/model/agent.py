@@ -168,37 +168,51 @@ class Agent(nn.Module):
         self.query_object_embedding_agent_2 = self.entity_lookup_table_agent_2(
             query_object)
 
+        def get_initial_state(self, batch_size):
+        """
+        Initializes the LSTM states as a list of tuples (h, c) for each layer, with the correct dimensions.
+        """
+        initial_state = [
+            (
+                torch.zeros(batch_size, self.m *
+                            self.embedding_size, device=self.device),
+                torch.zeros(batch_size, self.m *
+                            self.embedding_size, device=self.device)
+            )
+            for _ in range(self.hidden_layers)
+        ]
+        return initial_state
+
     def policy(self, input_action, which_agent):
         """
-        Processes input through the appropriate agent's LSTM policy, with proper state initialization.
+        Processes input through the appropriate agent's LSTM policy with explicit state initialization.
         """
-        # Select LSTM cells and current state for the agent
+        # Select the LSTM cells and current state for the agent
         if which_agent == 0:
             lstm_cells = self.policy_agent_1
+            if not self.state_agent_1:
+                self.state_agent_1 = self.get_initial_state(
+                    input_action.size(0))
             current_state = self.state_agent_1
         else:
             lstm_cells = self.policy_agent_2
+            if not self.state_agent_2:
+                self.state_agent_2 = self.get_initial_state(
+                    input_action.size(0))
             current_state = self.state_agent_2
 
-        # Properly initialize `current_state` if it's empty
-        if not current_state:
-            # Get the batch size from input action
-            temp_batch_size = input_action.size(0)
-            initial_state = torch.zeros(
-                self.hidden_layers, temp_batch_size, self.m * self.embedding_size, device=self.device)
-            current_state = [(initial_state, initial_state)
-                             for _ in range(self.hidden_layers)]
-
-        # Process input through LSTM layers
+        # Initialize `next_states` list to collect new states for each layer
         next_states = []
         current_input = input_action
+
+        # Process the input action through each LSTM layer
         for i, lstm in enumerate(lstm_cells):
             h, c = current_state[i]
             h, c = lstm(current_input, (h, c))
             next_states.append((h, c))
-            current_input = h
+            current_input = h  # Set the output as input for the next layer
 
-        # Update states
+        # Update the agent's state with the new states
         if which_agent == 0:
             self.state_agent_1 = next_states
         else:
