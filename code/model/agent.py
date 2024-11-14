@@ -1,25 +1,32 @@
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
 
 class Agent(nn.Module):
-    """
+    '''
+    Class for the agents in R2D2. Adapted from the agent class from https://github.com/shehzaadzd/MINERVA.
     A single instance of Agent contains both the pro and con agent.
-    """
+    '''
+
     def __init__(self, params, judge):
         super(Agent, self).__init__()
         self.judge = judge
         self.action_vocab_size = len(params['relation_vocab'])
         self.entity_vocab_size = len(params['entity_vocab'])
         self.embedding_size = params['embedding_size']
-        self.ePAD = torch.tensor(params['entity_vocab']['PAD'], dtype=torch.int32)
-        self.rPAD = torch.tensor(params['relation_vocab']['PAD'], dtype=torch.int32)
+        self.ePAD = torch.tensor(
+            params['entity_vocab']['PAD'], dtype=torch.int32)
+        self.rPAD = torch.tensor(
+            params['relation_vocab']['PAD'], dtype=torch.int32)
         self.train_entities = params['train_entity_embeddings']
         self.train_relations = params['train_relation_embeddings']
         self.test_rollouts = params['test_rollouts']
         self.path_length = params['path_length']
-        self.batch_size = params['batch_size'] * (1 + params['false_facts_train']) * params['num_rollouts']
-        self.dummy_start_label = torch.ones(self.batch_size, dtype=torch.int64) * params['relation_vocab']['DUMMY_START_RELATION']
+        self.batch_size = params['batch_size'] * \
+            (1 + params['false_facts_train']) * params['num_rollouts']
+        self.dummy_start_label = torch.ones(
+            self.batch_size, dtype=torch.int64) * params['relation_vocab']['DUMMY_START_RELATION']
 
         self.hidden_layers = params['layers_agent']
         self.custom_baseline = params['custom_baseline']
@@ -28,133 +35,239 @@ class Agent(nn.Module):
             self.entity_initializer = nn.init.xavier_uniform_
             self.m = 2
         else:
-            self.m = 1
             self.entity_initializer = nn.init.zeros_
+            self.m = 1
 
+        self.device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
         self.define_embeddings()
         self.define_agents_policy()
 
     def define_embeddings(self):
+        '''
+        For both agents, creates and adds the embeddings for the KG's relations and entities.
+        '''
+        # Agent 1 embeddings
         self.relation_lookup_table_agent_1 = nn.Embedding(
-            self.action_vocab_size, self.embedding_size
-        )
-        self.relation_lookup_table_agent_2 = nn.Embedding(
-            self.action_vocab_size, self.embedding_size
-        )
+            self.action_vocab_size, self.embedding_size)
         self.entity_lookup_table_agent_1 = nn.Embedding(
-            self.entity_vocab_size, self.embedding_size
-        )
-        self.entity_lookup_table_agent_2 = nn.Embedding(
-            self.entity_vocab_size, self.embedding_size
-        )
+            self.entity_vocab_size, self.embedding_size)
+        if not self.train_relations:
+            self.relation_lookup_table_agent_1.weight.requires_grad = False
+        if not self.train_entities:
+            self.entity_lookup_table_agent_1.weight.requires_grad = False
 
+        # Agent 2 embeddings
+        self.relation_lookup_table_agent_2 = nn.Embedding(
+            self.action_vocab_size, self.embedding_size)
+        self.entity_lookup_table_agent_2 = nn.Embedding(
+            self.entity_vocab_size, self.embedding_size)
+        if not self.train_relations:
+            self.relation_lookup_table_agent_2.weight.requires_grad = False
+        if not self.train_entities:
+            self.entity_lookup_table_agent_2.weight.requires_grad = False
+
+        # Initialize embeddings
         nn.init.xavier_uniform_(self.relation_lookup_table_agent_1.weight)
         nn.init.xavier_uniform_(self.relation_lookup_table_agent_2.weight)
-
         self.entity_initializer(self.entity_lookup_table_agent_1.weight)
         self.entity_initializer(self.entity_lookup_table_agent_2.weight)
 
     def define_agents_policy(self):
-        self.policy_agent_1 = nn.LSTM(self.m * self.embedding_size, self.m * self.embedding_size, self.hidden_layers, batch_first=True)
-        self.policy_agent_2 = nn.LSTM(self.m * self.embedding_size, self.m * self.embedding_size, self.hidden_layers, batch_first=True)
+        '''
+        Defines the agents' policy using LSTM cells.
+        '''
+        # Agent 1 policy
+        self.policy_agent_1 = nn.ModuleList([
+            nn.LSTMCell(input_size=self.m * self.embedding_size,
+                        hidden_size=self.m * self.embedding_size)
+            for _ in range(self.hidden_layers)
+        ])
+
+        # Agent 2 policy
+        self.policy_agent_2 = nn.ModuleList([
+            nn.LSTMCell(input_size=self.m * self.embedding_size,
+                        hidden_size=self.m * self.embedding_size)
+            for _ in range(self.hidden_layers)
+        ])
 
     def format_state(self, state):
-        return [state[:, i] for i in range(state.size(1))]
+        '''
+        Formats the cell- and hidden-state of the LSTM.
+        :param state: Tensor [hidden_layers_agent, 2, Batch_size, embedding_size * m]
+        :return: List of tuples containing (h, c) states for each layer
+        '''
+        formatted_state = []
+        for i in range(self.hidden_layers):
+            h = state[i][0]
+            c = state[i][1]
+            formatted_state.append((h, c))
+        return formatted_state
 
     def get_mem_shape(self):
+        '''
+        Returns the shape of the agent's LSTMCell.
+        '''
         return (self.hidden_layers, 2, None, self.m * self.embedding_size)
 
     def get_init_state_array(self, temp_batch_size):
+        '''
+        Returns initial state arrays for both agents' LSTMCells.
+        '''
         mem_agent = self.get_mem_shape()
-        agent_mem_1 = torch.zeros(mem_agent[0], mem_agent[1], temp_batch_size * self.test_rollouts, mem_agent[3]).type(torch.FloatTensor)
-        agent_mem_2 = torch.zeros(mem_agent[0], mem_agent[1], temp_batch_size * self.test_rollouts, mem_agent[3]).type(torch.FloatTensor)
-        return agent_mem_1, agent_mem_2
+        agent_mem_1 = np.zeros(
+            (mem_agent[0], mem_agent[1], temp_batch_size * self.test_rollouts, mem_agent[3])).astype('float32')
+        agent_mem_2 = np.zeros(
+            (mem_agent[0], mem_agent[1], temp_batch_size * self.test_rollouts, mem_agent[3])).astype('float32')
+        return torch.FloatTensor(agent_mem_1).to(self.device), torch.FloatTensor(agent_mem_2).to(self.device)
 
     def policy(self, input_action, which_agent):
-        def policy_1():
-            return self.policy_agent_1(input_action, self.state_agent_1)
+        '''
+        Processes input through the appropriate agent's LSTM policy.
+        '''
+        if which_agent == 0:
+            lstm_cells = self.policy_agent_1
+            current_state = self.state_agent_1
+        else:
+            lstm_cells = self.policy_agent_2
+            current_state = self.state_agent_2
 
-        def policy_2():
-            return self.policy_agent_2(input_action, self.state_agent_2)
+        # Process through LSTM layers
+        h, c = current_state[0]
+        next_states = []
+        current_input = input_action
 
-        output, new_state = torch.where(which_agent == 0, policy_1(), policy_2())
-        new_state_stacked = torch.stack(new_state)
-        state_agent_1_stacked = torch.stack(self.state_agent_1)
-        state_agent_1_stacked = (1-which_agent)*new_state_stacked + which_agent* state_agent_1_stacked
-        self.state_agent_1 = self.format_state(state_agent_1_stacked)
+        for i, lstm in enumerate(lstm_cells):
+            h, c = lstm(current_input, (h, c))
+            next_states.append((h, c))
+            current_input = h
 
-        state_agent_2_stacked = torch.stack(self.state_agent_2)
-        state_agent_2_stacked = which_agent*new_state_stacked + (1-which_agent)* state_agent_2_stacked
-        self.state_agent_2 = self.format_state(state_agent_2_stacked)
+        # Update states
+        if which_agent == 0:
+            self.state_agent_1 = next_states
+            self.state_agent_2 = self.state_agent_2
+        else:
+            self.state_agent_1 = self.state_agent_1
+            self.state_agent_2 = next_states
 
-        return output
+        return h
 
     def action_encoder_agent(self, next_relations, current_entities, which_agent):
-        relation_embedding = torch.where(which_agent == 0, self.relation_lookup_table_agent_1, self.relation_lookup_table_agent_2)
-        entity_embedding = torch.where(which_agent == 0, self.entity_lookup_table_agent_1, self.entity_lookup_table_agent_2)
+        '''
+        Encodes available actions for an agent.
+        '''
+        if which_agent == 0:
+            relation_embedding = self.relation_lookup_table_agent_1(
+                next_relations)
+            entity_embedding = self.entity_lookup_table_agent_1(
+                current_entities)
+        else:
+            relation_embedding = self.relation_lookup_table_agent_2(
+                next_relations)
+            entity_embedding = self.entity_lookup_table_agent_2(
+                current_entities)
 
         if self.use_entity_embeddings:
-            action_embedding = torch.cat([relation_embedding[next_relations], entity_embedding[current_entities]], dim=-1)
+            action_embedding = torch.cat(
+                [relation_embedding, entity_embedding], dim=-1)
         else:
-            action_embedding = relation_embedding[next_relations]
+            action_embedding = relation_embedding
 
         return action_embedding
 
     def set_query_embeddings(self, query_subject, query_relation, query_object):
-        self.query_subject_embedding_agent_1 = self.entity_lookup_table_agent_1[query_subject]
-        self.query_relation_embedding_agent_1 = self.relation_lookup_table_agent_1[query_relation]
-        self.query_object_embedding_agent_1 = self.entity_lookup_table_agent_1[query_object]
+        '''
+        Sets query embeddings for both agents.
+        '''
+        self.query_subject_embedding_agent_1 = self.entity_lookup_table_agent_1(
+            query_subject)
+        self.query_relation_embedding_agent_1 = self.relation_lookup_table_agent_1(
+            query_relation)
+        self.query_object_embedding_agent_1 = self.entity_lookup_table_agent_1(
+            query_object)
 
-        self.query_subject_embedding_agent_2 = self.entity_lookup_table_agent_2[query_subject]
-        self.query_relation_embedding_agent_2 = self.relation_lookup_table_agent_2[query_relation]
-        self.query_object_embedding_agent_2 = self.entity_lookup_table_agent_2[query_object]
+        self.query_subject_embedding_agent_2 = self.entity_lookup_table_agent_2(
+            query_subject)
+        self.query_relation_embedding_agent_2 = self.relation_lookup_table_agent_2(
+            query_relation)
+        self.query_object_embedding_agent_2 = self.entity_lookup_table_agent_2(
+            query_object)
 
-    def step(self, next_relations, next_entities, prev_state_agent_1, prev_state_agent_2, prev_relation, current_entities, range_arr, which_agent, random_flag):
+    def step(self, next_relations, next_entities, prev_state_agent_1,
+             prev_state_agent_2, prev_relation, current_entities, range_arr, which_agent, random_flag):
+        '''
+        Computes a step for an agent during the debate.
+        '''
         self.state_agent_1 = prev_state_agent_1
         self.state_agent_2 = prev_state_agent_2
-        is_agent_1 = which_agent == 0
 
-        prev_entity = torch.where(is_agent_1, self.entity_lookup_table_agent_1[current_entities], self.entity_lookup_table_agent_2[current_entities])
-        prev_relation = torch.where(is_agent_1, self.relation_lookup_table_agent_1[prev_relation], self.relation_lookup_table_agent_2[prev_relation])
+        # Get state vector
+        if which_agent == 0:
+            prev_entity = self.entity_lookup_table_agent_1(current_entities)
+            prev_relation_emb = self.relation_lookup_table_agent_1(
+                prev_relation)
+        else:
+            prev_entity = self.entity_lookup_table_agent_2(current_entities)
+            prev_relation_emb = self.relation_lookup_table_agent_2(
+                prev_relation)
 
         if self.use_entity_embeddings:
-            state = torch.cat([prev_relation, prev_entity], dim=-1)
+            state = torch.cat([prev_relation_emb, prev_entity], dim=-1)
         else:
-            state = prev_relation
+            state = prev_relation_emb
 
-        def get_policy_state():
-            query_subject_embedding = self.query_subject_embedding_agent_1 if is_agent_1 else self.query_subject_embedding_agent_2
-            query_relation_embedding = self.query_relation_embedding_agent_1 if is_agent_1 else self.query_relation_embedding_agent_2
-            query_object_embedding = self.query_object_embedding_agent_1 if is_agent_1 else self.query_object_embedding_agent_2
+        # Get query embeddings based on agent
+        if which_agent == 0:
+            query_subject_embedding = self.query_subject_embedding_agent_1
+            query_relation_embedding = self.query_relation_embedding_agent_1
+            query_object_embedding = self.query_object_embedding_agent_1
+        else:
+            query_subject_embedding = self.query_subject_embedding_agent_2
+            query_relation_embedding = self.query_relation_embedding_agent_2
+            query_object_embedding = self.query_object_embedding_agent_2
 
-            state_query_concat = torch.cat([state, query_subject_embedding, query_relation_embedding, query_object_embedding], dim=-1)
-            return state_query_concat
+        state_query_concat = torch.cat([
+            state, query_subject_embedding, query_relation_embedding, query_object_embedding
+        ], dim=-1)
 
-        #TODO : check lai code
-        candidate_action_embeddings = self.action_encoder_agent(next_relations, current_entities, which_agent)
-        output, (new_hidden, new_cell) = self.policy(get_policy_state(), which_agent)
-        # self.state_agent_1 = (new_hidden, new_cell)
-        # self.state_agent_2 = (new_hidden, new_cell)
-
+        # Get action embeddings and scores
+        candidate_action_embeddings = self.action_encoder_agent(
+            next_relations, next_entities, which_agent)
+        output = self.policy(state_query_concat, which_agent)
         output_expanded = output.unsqueeze(1)
-        prelim_scores = torch.sum(output_expanded * candidate_action_embeddings, dim=2)
+        prelim_scores = torch.sum(
+            candidate_action_embeddings * output_expanded, dim=2)
 
-        comparison_tensor = torch.ones_like(next_relations, dtype=torch.int32) * self.rPAD
-        mask = next_relations == comparison_tensor
-        dummy_scores = torch.ones_like(prelim_scores) * -99999.0
-        scores = torch.where(mask, dummy_scores, prelim_scores)
-        uni_scores = torch.where(mask, dummy_scores, torch.ones_like(prelim_scores))
+        # Mask PAD actions
+        mask = (next_relations == self.rPAD)
+        scores = torch.where(mask, torch.ones_like(
+            prelim_scores) * -99999.0, prelim_scores)
+        uni_scores = torch.where(mask, torch.ones_like(
+            prelim_scores) * -99999.0, torch.ones_like(prelim_scores))
 
-        action = torch.multinomial(F.softmax(scores, dim=1), 1).squeeze(1)
-        action = torch.where(random_flag, torch.multinomial(F.softmax(uni_scores, dim=1), 1).squeeze(1), action)
+        # Sample action
+        if random_flag:
+            action = torch.multinomial(torch.softmax(uni_scores, dim=-1), 1)
+        else:
+            action = torch.multinomial(torch.softmax(scores, dim=-1), 1)
 
-        label_action = action
-        loss = F.cross_entropy(scores, label_action)
+        action_idx = action.squeeze()
+        loss = nn.functional.cross_entropy(
+            scores, action_idx, reduction='none')
 
-        action_idx = action
-        chosen_relation = next_relations[range_arr, action_idx]
+        # Get chosen relation
+        batch_indices = torch.arange(
+            next_relations.size(0), device=self.device)
+        chosen_relation = next_relations[batch_indices, action_idx]
 
-        return loss, self.state_agent_1, self.state_agent_2, F.log_softmax(scores, dim=1), action_idx, chosen_relation
+        return (
+            loss,
+            self.state_agent_1,
+            self.state_agent_2,
+            nn.functional.log_softmax(scores, dim=-1),
+            action_idx,
+            chosen_relation
+        )
 
     def forward(self, which_agent, candidate_relation_sequence, candidate_entity_sequence, current_entities, range_arr, T=3, random_flag=None):
         def get_prev_state_agents():
@@ -165,7 +278,8 @@ class Agent(nn.Module):
             return prev_state_agent_1, prev_state_agent_2
 
         prev_relation = self.dummy_start_label
-        argument = self.judge.action_encoder_judge(prev_relation, prev_relation)
+        argument = self.judge.action_encoder_judge(
+            prev_relation, prev_relation)
 
         all_loss = []
         all_logits = []
@@ -208,16 +322,19 @@ class Agent(nn.Module):
                 arguments_representations.append(rep_argu)
                 all_rewards_before_baseline.append(rewards)
                 if self.custom_baseline:
-                    no_op_arg = self.judge.action_encoder_judge(prev_relation, prev_relation)
+                    no_op_arg = self.judge.action_encoder_judge(
+                        prev_relation, prev_relation)
                     for i in range(self.path_length):
                         no_op_arg = self.judge.extend_argument(no_op_arg, torch.tensor(i, dtype=torch.int32), torch.zeros_like(idx),
                                                                candidate_relation_sequence[0], candidate_entity_sequence[0],
                                                                range_arr)
-                    no_op_logits, rep_argu = self.judge.classify_argument(no_op_arg)
+                    no_op_logits, rep_argu = self.judge.classify_argument(
+                        no_op_arg)
                     rewards_no_op = torch.sigmoid(no_op_logits)
                     all_rewards_agents.append(rewards - rewards_no_op)
                 else:
                     all_rewards_agents.append(rewards)
 
-        loss_judge, final_logit_judge = self.judge.final_loss(arguments_representations)
+        loss_judge, final_logit_judge = self.judge.final_loss(
+            arguments_representations)
         return loss_judge, final_logit_judge, all_temp_logits_judge, all_loss, all_logits, action_idx, all_rewards_agents, all_rewards_before_baseline
