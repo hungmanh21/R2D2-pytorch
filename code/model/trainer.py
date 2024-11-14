@@ -102,40 +102,53 @@ class Trainer:
         return entropy_policy_1, entropy_policy_2
 
     def train(self):
+        """
+        Trains the model using the environment, agent, and judge.
+        """
         self.agent.train()
         self.judge.train()
         self.batch_counter = 0
+
+        # Initialize debate printer for debugging or logging
         debate_printer = Debate_Printer(
             self.output_dir, self.train_environment.grapher, self.num_rollouts
         )
 
         for episode in self.train_environment.get_episodes():
+            # Decide whether to train the judge or the agent
             is_train_judge = (self.batch_counter // self.train_judge_every) % 2 == 0 \
                 or self.batch_counter >= self.rounds_sub_training
+
             logger.info(f"BATCH COUNTER: {self.batch_counter}")
             self.batch_counter += 1
 
+            # Fetch query and labels from the episode
             query_subjects = episode.get_query_subjects()
             query_relation = episode.get_query_relation()
             query_objects = episode.get_query_objects()
             labels = episode.get_labels()
 
+            # Set embeddings in agent and judge
             self.agent.set_query_embeddings(
                 query_subjects, query_relation, query_objects)
             self.judge.set_query_embeddings(
                 query_subjects, query_relation, query_objects)
 
+            # Run the agent to generate actions and logits
             loss_judge, final_logit_judge, _, per_example_loss, per_example_logits, action_idx, rewards_agents, _ = \
                 self.agent(
-                    which_agent=[0.0] * self.number_steps,
-                    candidate_relation_sequence=episode.get_candidate_relation_sequence(),
-                    candidate_entity_sequence=episode.get_candidate_entity_sequence(),
-                    current_entities=episode.get_current_entities(),
-                    range_arr=torch.arange(self.batch_size),
+                    which_agent=[0.0] * (self.number_steps // 2) +
+                    [1.0] * (self.number_steps // 2),
+                    candidate_relation_sequence=episode.state["next_relations"],
+                    candidate_entity_sequence=episode.state["next_entities"],
+                    current_entities=episode.state["current_entities"],
+                    range_arr=torch.arange(
+                        self.batch_size, device=self.agent.device),
                     T=self.number_steps,
                     random_flag=False,
                 )
 
+            # Train judge or agent based on the batch count
             if is_train_judge:
                 self.optimizer_judge.zero_grad()
                 loss_judge.backward()
@@ -146,49 +159,60 @@ class Trainer:
                     per_example_loss,
                     which_agent_sequence=[
                         0.0] * (self.number_steps // 2) + [1.0] * (self.number_steps // 2),
-                    rewards={"reward_1": rewards_agents[:self.number_steps // 2],
-                             "reward_2": rewards_agents[self.number_steps // 2:]},
-                    entropy_reg_coeff=self.decaying_beta
+                    rewards={
+                        "reward_1": rewards_agents[:self.number_steps // 2],
+                        "reward_2": rewards_agents[self.number_steps // 2:],
+                    },
+                    entropy_reg_coeff=self.decaying_beta,
                 )
 
                 self.optimizer_agents.zero_grad()
                 (loss_1 + loss_2).backward()
                 self.optimizer_agents.step()
 
+            # Evaluate model periodically
             if self.batch_counter % self.eval_every == 0:
                 self.test(is_dev_environment=True)
 
     def test(self, is_dev_environment):
+        """
+        Tests the model using the environment and computes metrics.
+        """
         self.agent.eval()
         self.judge.eval()
 
+        # Select appropriate environment
         environment = self.dev_test_environment if is_dev_environment else self.test_test_environment
         debate_printer = Debate_Printer(
             self.output_dir, self.train_environment.grapher, self.test_rollouts, is_append=True
         )
 
+        # Initialize metrics
         hits_at_1, hits_at_3, hits_at_10, hits_at_20 = 0, 0, 0, 0
         mean_reciprocal_rank, total_examples = 0, 0
 
         for episode in environment.get_episodes():
-            temp_batch_size = episode.no_examples
+            # Fetch query and labels
             query_subjects = episode.get_query_subjects()
             query_relation = episode.get_query_relation()
             query_objects = episode.get_query_objects()
             labels = episode.get_labels()
 
+            # Set embeddings in agent and judge
             self.agent.set_query_embeddings(
                 query_subjects, query_relation, query_objects)
             self.judge.set_query_embeddings(
                 query_subjects, query_relation, query_objects)
 
+            # Run the agent for predictions
             logits, _, _, _, _, action_idx, _, _ = self.agent(
                 which_agent=[0.0] * (self.number_steps // 2) +
                 [1.0] * (self.number_steps // 2),
-                candidate_relation_sequence=episode.get_candidate_relation_sequence(),
-                candidate_entity_sequence=episode.get_candidate_entity_sequence(),
-                current_entities=episode.get_current_entities(),
-                range_arr=torch.arange(temp_batch_size),
+                candidate_relation_sequence=episode.state["next_relations"],
+                candidate_entity_sequence=episode.state["next_entities"],
+                current_entities=episode.state["current_entities"],
+                range_arr=torch.arange(episode.no_examples,
+                                       device=self.agent.device),
                 T=self.number_steps,
                 random_flag=False,
             )
@@ -196,17 +220,18 @@ class Trainer:
             logits = logits.detach()
             predictions = torch.sigmoid(logits).squeeze().round()
 
+            # Calculate metrics
             hits_at_1 += (predictions == labels).sum().item()
             total_examples += len(labels)
 
-            # Compute additional metrics like hits@3, hits@10, and MRR
+            # Compute additional metrics like Hits@3, Hits@10, and MRR
             ranks = torch.argsort(torch.argsort(-logits, dim=0), dim=0) + 1
             mean_reciprocal_rank += (1 / ranks).sum().item()
             hits_at_3 += (ranks <= 3).sum().item()
             hits_at_10 += (ranks <= 10).sum().item()
             hits_at_20 += (ranks <= 20).sum().item()
 
-        # Calculate final metrics
+        # Log metrics
         logger.info(f"Hits@1: {hits_at_1 / total_examples:.4f}")
         logger.info(f"Hits@3: {hits_at_3 / total_examples:.4f}")
         logger.info(f"Hits@10: {hits_at_10 / total_examples:.4f}")
