@@ -39,7 +39,8 @@ class Trainer:
         self.test_test_environment = env(params, 'test')
         self.number_steps = self.path_length * self.number_arguments * 2
         self.best_metric = best_metric
-
+        self.device = device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu")
         # Optimizers for judge and agents
         self.learning_rate_judge = params['learning_rate_judge']
         self.optimizer_judge = optim.Adam(

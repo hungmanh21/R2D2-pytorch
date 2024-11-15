@@ -36,6 +36,9 @@ class Agent(nn.Module):
         self.custom_baseline = params['custom_baseline']
         self.use_entity_embeddings = params['use_entity_embeddings']
 
+        self.device = device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu")
+
         if self.use_entity_embeddings:
             self.m = 2
             self.entity_init = nn.init.xavier_uniform_
