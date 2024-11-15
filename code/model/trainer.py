@@ -104,12 +104,89 @@ class Trainer:
 
         return entropy_policy_1, entropy_policy_2
 
+    def train_judge(self, episode):
+        """
+        Train the Judge model on a given episode.
+        """
+        query_subjects = episode.get_query_subjects()
+        query_relation = episode.get_query_relation()
+        query_objects = episode.get_query_objects()
+        labels = episode.get_labels()
+
+        # Set query embeddings
+        self.judge.set_query_embeddings(
+            query_subjects, query_relation, query_objects)
+
+        # Run the Judge
+        loss_judge, _, _, per_example_loss, _, _, _, _ = self.agent(
+            which_agent=[0.0] * (self.number_steps // 2) +
+            [1.0] * (self.number_steps // 2),
+            candidate_relation_sequence=episode.state["next_relations"],
+            candidate_entity_sequence=episode.state["next_entities"],
+            current_entities=episode.state["current_entities"],
+            T=self.number_steps,
+            random_flag=False,
+        )
+
+        # Update Judge
+        self.optimizer_judge.zero_grad()
+        loss_judge.backward()
+        self.optimizer_judge.step()
+
+        logging.info(f"Judge trained on batch. Loss: {loss_judge.item():.4f}")
+
+
+    def train_agents(self, episode):
+        """
+        Train the Agent models on a given episode.
+        """
+        query_subjects = episode.get_query_subjects()
+        query_relation = episode.get_query_relation()
+        query_objects = episode.get_query_objects()
+
+        # Set query embeddings
+        self.agent.set_query_embeddings(
+            query_subjects, query_relation, query_objects)
+
+        # Run the Agent
+        _, _, _, per_example_loss, _, _, rewards_agents, _ = self.agent(
+            which_agent=[0.0] * (self.number_steps // 2) +
+            [1.0] * (self.number_steps // 2),
+            candidate_relation_sequence=episode.state["next_relations"],
+            candidate_entity_sequence=episode.state["next_entities"],
+            current_entities=episode.state["current_entities"],
+            T=self.number_steps,
+            random_flag=False,
+        )
+
+        # Compute REINFORCE loss
+        loss_1, loss_2 = self.calc_reinforce_loss(
+            per_example_loss,
+            which_agent_sequence=[
+                0.0] * (self.number_steps // 2) + [1.0] * (self.number_steps // 2),
+            rewards={
+                "reward_1": rewards_agents[:self.number_steps // 2],
+                "reward_2": rewards_agents[self.number_steps // 2:],
+            },
+            entropy_reg_coeff=self.decaying_beta,
+        )
+
+        # Update Agents
+        self.optimizer_agents.zero_grad()
+        (loss_1 + loss_2).backward()
+        self.optimizer_agents.step()
+
+        logging.info(
+            f"Agents trained on batch. Loss 1: {loss_1.item():.4f}, Loss 2: {loss_2.item():.4f}")
+
+
     def train(self):
+        """
+        Training loop for the Trainer, alternating between Judge and Agents.
+        """
         self.agent.train()
         self.judge.train()
         self.batch_counter = 0
-        debate_printer = Debate_Printer(
-            self.output_dir, self.train_environment.grapher, self.num_rollouts)
 
         for episode in self.train_environment.get_episodes():
             is_train_judge = (self.batch_counter // self.train_judge_every) % 2 == 0 \
@@ -117,50 +194,10 @@ class Trainer:
 
             self.batch_counter += 1
 
-            query_subjects = episode.get_query_subjects()
-            query_relation = episode.get_query_relation()
-            query_objects = episode.get_query_objects()
-            labels = episode.get_labels()
-
-            # Set query embeddings
-            self.agent.set_query_embeddings(
-                query_subjects, query_relation, query_objects)
-            self.judge.set_query_embeddings(
-                query_subjects, query_relation, query_objects)
-
-            # Run agent
-            loss_judge, final_logit_judge, _, per_example_loss, per_example_logits, action_idx, rewards_agents, _ = \
-                self.agent(
-                    which_agent=[0.0] * (self.number_steps // 2) +
-                    [1.0] * (self.number_steps // 2),
-                    candidate_relation_sequence=episode.state["next_relations"],
-                    candidate_entity_sequence=episode.state["next_entities"],
-                    current_entities=episode.state["current_entities"],
-                    range_arr=torch.arange(
-                        self.batch_size, device=self.agent.device),
-                    T=self.number_steps,
-                    random_flag=False,
-                )
-
             if is_train_judge:
-                self.optimizer_judge.zero_grad()
-                loss_judge.backward()
-                self.optimizer_judge.step()
+                self.train_judge(episode)
             else:
-                # Compute REINFORCE loss for agents
-                loss_1, loss_2 = self.calc_reinforce_loss(
-                    per_example_loss,
-                    which_agent_sequence=[
-                        0.0] * (self.number_steps // 2) + [1.0] * (self.number_steps // 2),
-                    rewards={
-                        "reward_1": rewards_agents[:self.number_steps // 2],
-                        "reward_2": rewards_agents[self.number_steps // 2:],
-                    },
-                    entropy_reg_coeff=self.decaying_beta,
-                )
-                self.optimizer_agents.zero_grad()
-                (loss_1 + loss_2).backward()
-                self.optimizer_agents.step()
+                self.train_agents(episode)
 
             if self.batch_counter % self.eval_every == 0:
                 self.test(is_dev_environment=True)
