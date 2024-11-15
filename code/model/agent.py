@@ -36,7 +36,7 @@ class Agent(nn.Module):
         self.custom_baseline = params['custom_baseline']
         self.use_entity_embeddings = params['use_entity_embeddings']
 
-        self.device = device = torch.device(
+        self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
 
         if self.use_entity_embeddings:
