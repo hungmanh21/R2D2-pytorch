@@ -39,7 +39,7 @@ class Trainer:
         self.test_test_environment = env(params, 'test')
         self.number_steps = self.path_length * self.number_arguments * 2
         self.best_metric = best_metric
-        self.device  = torch.device(
+        self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
         # Optimizers for judge and agents
         self.learning_rate_judge = params['learning_rate_judge']
@@ -106,7 +106,7 @@ class Trainer:
 
     def train_judge(self, episode):
         """
-        Train the Judge model on a given episode.
+        Train the Judge model.
         """
         query_subjects = episode.get_query_subjects()
         query_relation = episode.get_query_relation()
@@ -117,24 +117,39 @@ class Trainer:
         self.judge.set_query_embeddings(
             query_subjects, query_relation, query_objects)
 
-        # Run the Judge
-        loss_judge, _, _, per_example_loss, _, _, _, _ = self.agent(
-            which_agent=[0.0] * (self.number_steps // 2) +
-            [1.0] * (self.number_steps // 2),
-            candidate_relation_sequence=episode.state["next_relations"],
-            candidate_entity_sequence=episode.state["next_entities"],
-            current_entities=episode.state["current_entities"],
-            T=self.number_steps,
-            random_flag=False,
-        )
+        # Collect arguments to evaluate
+        arguments = []
+        for t in range(self.number_steps // self.path_length):
+            relations = episode.state["next_relations"]
+            entities = episode.state["next_entities"]
+            range_tensor = torch.arange(self.batch_size, device=self.device)
 
-        # Update Judge
+            # Extend argument
+            argument = self.judge.extend_argument(
+                argument=torch.zeros(
+                    (self.batch_size, self.judge.embedding_size * 2), device=self.device),
+                t=t,
+                action_idx=torch.zeros(
+                    self.batch_size, dtype=torch.long, device=self.device),
+                next_relations=relations,
+                next_entities=entities,
+                range_arr=range_tensor
+            )
+            arguments.append(argument)
+
+        # Compute final loss for Judge
+        logits, _ = self.judge.classify_argument(
+            torch.stack(arguments, dim=0).mean(dim=0),
+            self.judge.query_relation_embedding,
+            self.judge.query_object_embedding
+        )
+        loss = nn.BCEWithLogitsLoss()(logits.squeeze(), labels.float())
+
         self.optimizer_judge.zero_grad()
-        loss_judge.backward()
+        loss.backward()
         self.optimizer_judge.step()
 
-        logging.info(f"Judge trained on batch. Loss: {loss_judge.item():.4f}")
-
+        logger.info(f"Judge trained. Loss: {loss.item():.4f}")
 
     def train_agents(self, episode):
         """
@@ -178,7 +193,6 @@ class Trainer:
 
         logging.info(
             f"Agents trained on batch. Loss 1: {loss_1.item():.4f}, Loss 2: {loss_2.item():.4f}")
-
 
     def train(self):
         """
