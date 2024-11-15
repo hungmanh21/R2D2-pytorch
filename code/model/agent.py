@@ -145,6 +145,7 @@ class Agent(nn.Module):
         '''
         Sets query embeddings for both agents.
         '''
+        print("In set query")
         self.query_subject_embedding_agent_1 = self.entity_lookup_table_agent_1(
             query_subject)
         self.query_relation_embedding_agent_1 = self.relation_lookup_table_agent_1(
