@@ -1,154 +1,171 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 
 class Judge(nn.Module):
-    """
-    Class representing the Judge in R2D2. Adapted from the agent class from https://github.com/shehzaadzd/MINERVA.
-
-    It evaluates the arguments that the agents present and assigns them a score
-    that is used to train the agents. Furthermore, it assigns the final prediction score to the whole debate.
-    """
-
     def __init__(self, params):
         """
         Initializes the judge.
 
         :param params: Dict. Parameters of the experiment.
         """
-        super(Judge, self).__init__()
+        super().__init__()
+
+        # Basic parameters
         self.path_length = params['path_length']
         self.action_vocab_size = len(params['relation_vocab'])
         self.entity_vocab_size = len(params['entity_vocab'])
         self.embedding_size = params['embedding_size']
         self.hidden_size = params['hidden_size']
-        self.use_entity_embeddings = params['use_entity_embeddings']
-        self.hidden_layers = params['layers_judge']
+        self.use_entity_embeddings = params.get('use_entity_embeddings', False)
+        self.train_entities = params.get('train_entity_embeddings', True)
+        self.train_relations = params.get('train_relation_embeddings', True)
+        self.hidden_layers = params.get('layers_judge', 2)
 
-        # Embedding layers
-        self.relation_embeddings = nn.Embedding(
-            self.action_vocab_size, self.embedding_size
+        # Embeddings
+        self.relation_embedding = nn.Embedding(
+            self.action_vocab_size,
+            self.embedding_size,
+            _weight=self._get_xavier_initialization(
+                self.action_vocab_size, self.embedding_size)
         )
-        self.entity_embeddings = nn.Embedding(
-            self.entity_vocab_size, self.embedding_size
-        )
+        self.relation_embedding.weight.requires_grad = self.train_relations
 
-        if params['use_entity_embeddings']:
-            nn.init.xavier_uniform_(self.entity_embeddings.weight)
-        else:
-            nn.init.zeros_(self.entity_embeddings.weight)
-
-        nn.init.xavier_uniform_(self.relation_embeddings.weight)
-
-        self.train_entities = params['train_entity_embeddings']
-        self.train_relations = params['train_relation_embeddings']
-        self.entity_embeddings.weight.requires_grad = True if self.train_entities else False
-        self.relation_embeddings.weight.requires_grad = True if self.train_relations else False
-
-        self.device = torch.device(
-            'cuda' if torch.cuda.is_available() else 'cpu')
-
-        # Define MLP layers
-        self.mlp = nn.ModuleList()
-        for i in range(self.hidden_layers):
-            input_dim = (
-                self.hidden_size
-                if i > 0
-                else (
-                    self.path_length * 2 * self.embedding_size
-                    + 2 * self.embedding_size
-                    if self.use_entity_embeddings
-                    else self.path_length * self.embedding_size + 2 * self.embedding_size
-                )
+        # Entity embedding initialization
+        if self.use_entity_embeddings:
+            self.entity_embedding = nn.Embedding(
+                self.entity_vocab_size,
+                self.embedding_size,
+                _weight=self._get_xavier_initialization(
+                    self.entity_vocab_size, self.embedding_size)
             )
-            self.mlp.append(nn.Linear(input_dim, self.hidden_size))
+        else:
+            self.entity_embedding = nn.Embedding(
+                self.entity_vocab_size,
+                self.embedding_size,
+                _weight=torch.zeros(self.entity_vocab_size,
+                                    self.embedding_size)
+            )
+        self.entity_embedding.weight.requires_grad = self.train_entities
 
-        # Output layer
-        self.classifier = nn.Linear(self.hidden_size, 1)
+        # Classifier MLP
+        mlp_layers = []
+        input_dim = (self.path_length *
+                     (2 if self.use_entity_embeddings else 1) + 2) * self.embedding_size
+        for i in range(self.hidden_layers - 1):
+            mlp_layers.append(nn.Linear(input_dim if i ==
+                              0 else self.hidden_size, self.hidden_size))
+            mlp_layers.append(nn.ReLU())
+        mlp_layers.append(nn.Linear(self.hidden_size, self.hidden_size))
+        self.mlp = nn.Sequential(*mlp_layers)
+
+        # Final classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, 1)
+        )
+
+        # Placeholders (using attributes instead)
+        self.query_subject_embedding = None
+        self.query_relation_embedding = None
+        self.query_object_embedding = None
+        self.labels = None
+
+    def _get_xavier_initialization(self, num_rows, embedding_size):
+        """
+        Create xavier initialized weights
+        """
+        weights = torch.empty(num_rows, embedding_size)
+        nn.init.xavier_uniform_(weights)
+        return weights
 
     def action_encoder_judge(self, next_relations, next_entities):
         """
         Encodes an action into its embedded representation.
-
-        :param next_relations: Tensor, [Batch_size]. Tensor with the ids of the picked relations.
-        :param next_entities: Tensor, [Batch_size]. Tensor with the ids of the picked target entities.
-        :return: Tensor. Embedded representation of the picked action.
         """
-        relation_embedding = self.relation_embeddings(next_relations)
-        entity_embedding = self.entity_embeddings(next_entities)
+        relation_embedding = self.relation_embedding(next_relations)
+        entity_embedding = self.entity_embedding(next_entities)
+
         if self.use_entity_embeddings:
-            action_embedding = torch.cat(
-                [relation_embedding, entity_embedding], dim=-1)
-        else:
-            action_embedding = relation_embedding
-        return action_embedding
+            return torch.cat([relation_embedding, entity_embedding], dim=-1)
+        return relation_embedding
 
     def extend_argument(self, argument, t, action_idx, next_relations, next_entities, range_arr):
         """
         Extends an argument by adding the embedded representation of an action.
-
-        :param argument: Tensor, [Batch_size, None]. Argument to be extended.
-        :param t: Tensor, []. Step number for the episode.
-        :param action_idx: Tensor, [Batch_size]. Number of the selected action.
-        :param next_relations: Tensor, [Batch_size, max_num_actions]. Contains the ids of all possible next relations.
-        :param next_entities: Tensor, [Batch_size, max_num_actions]. Contains the ids of all possible next entities.
-        :param range_arr: Tensor, [Batch_size]. Range tensor to select the correct next action.
-        :return: Tensor. Extended argument.
         """
+        # Get chosen relation and entity using advanced indexing
         chosen_relation = next_relations[range_arr, action_idx]
-        chosen_entity = next_entities[range_arr, action_idx]
+        chosen_entities = next_entities[range_arr, action_idx]
+
+        # Encode the action
         action_embedding = self.action_encoder_judge(
-            chosen_relation, chosen_entity)
+            chosen_relation, chosen_entities)
 
+        # Extend or replace argument based on step
         if t % self.path_length == 0:
-            argument = action_embedding
+            return action_embedding
         else:
-            argument = torch.cat([argument, action_embedding], dim=-1)
+            return torch.cat([argument, action_embedding], dim=-1)
 
-        return argument
-
-    def classify_argument(self, argument, query_relation_embedding, query_object_embedding):
+    def classify_argument(self, argument):
         """
         Classifies arguments by computing a hidden representation and assigning logits.
-
-        :param argument: Tensor. Embedded representation of the arguments.
-        :param query_relation_embedding: Tensor. Embedded query relation.
-        :param query_object_embedding: Tensor. Embedded query object.
-        :return: Tensor. Logits for the arguments and hidden representation.
         """
-        argument = torch.cat(
-            [argument, query_relation_embedding, query_object_embedding], dim=-1
-        )
-        hidden = argument
-        for layer in self.mlp:
-            hidden = F.relu(layer(hidden))
+        # Concatenate query embeddings
+        argument = torch.cat([
+            argument,
+            self.query_relation_embedding,
+            self.query_object_embedding
+        ], dim=-1)
+
+        # Reshape argument for MLP
+        if self.use_entity_embeddings:
+            argument = argument.view(-1, self.path_length *
+                                     2 * self.embedding_size + 2 * self.embedding_size)
+        else:
+            argument = argument.view(-1, self.path_length *
+                                     self.embedding_size + 2 * self.embedding_size)
+
+        # Pass through MLP
+        hidden = self.mlp(argument)
+
+        # Get logits
         logits = self.classifier(hidden)
+
         return logits, hidden
 
-    def final_loss(self, rep_argu_list, labels):
+    def final_loss(self, rep_argu_list):
         """
         Computes the final loss and final logits of the debates using all arguments presented.
-
-        :param rep_argu_list: List of Tensors. Hidden representations of the arguments.
-        :param labels: Tensor. Ground truth labels.
-        :return: Tuple. Final loss and final logits.
         """
-        average_argu = torch.mean(torch.stack(rep_argu_list, dim=-1), dim=-1)
-        logits = self.classifier(average_argu)
-        loss = F.binary_cross_entropy_with_logits(logits, labels)
-        return loss, logits
+        # Average the arguments
+        average_argu = torch.mean(torch.stack(rep_argu_list), dim=0)
+
+        # Get final logit
+        final_logit = self.classifier(average_argu)
+
+        # Compute loss
+        final_loss = F.binary_cross_entropy_with_logits(
+            final_logit,
+            self.labels.float()
+        )
+
+        return final_loss, final_logit
 
     def set_query_embeddings(self, query_subject, query_relation, query_object):
         """
-        Sets the judge's query information.
+        Sets the judge's query embeddings.
         """
-        query_subject = query_subject.clone().detach()
-        query_relation = query_relation.clone().detach()
-        query_object = query_object.clone().detach()
+        self.query_subject_embedding = self.entity_embedding(query_subject)
+        self.query_relation_embedding = self.relation_embedding(query_relation)
+        self.query_object_embedding = self.entity_embedding(query_object)
 
-        # Set embeddings for the query
-        self.query_subject_embedding = self.entity_embeddings(query_subject)
-        self.query_relation_embedding = self.relation_embeddings(
-            query_relation)
-        self.query_object_embedding = self.entity_embeddings(query_object)
+    def set_labels_placeholder(self, labels):
+        """
+        Setter for the labels.
+        """
+        self.labels = labels
