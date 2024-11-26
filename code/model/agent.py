@@ -50,7 +50,7 @@ class Agent(nn.Module):
             padding_idx=self.rPAD
         )
         nn.init.xavier_uniform_(self.relation_embedding_1.weight)
-        self.relation_embedding_1.weight.requires_grad = self.train_relations
+        self.relation_embedding_1.weight.requires_grad = True if self.train_relations == 1 else False
 
         self.relation_embedding_2 = nn.Embedding(
             self.action_vocab_size,
@@ -58,7 +58,7 @@ class Agent(nn.Module):
             padding_idx=self.rPAD
         )
         nn.init.xavier_uniform_(self.relation_embedding_2.weight)
-        self.relation_embedding_2.weight.requires_grad = self.train_relations
+        self.relation_embedding_2.weight.requires_grad = True if self.train_relations == 1 else False
 
         # Entity embeddings for both agents
         self.entity_embedding_1 = nn.Embedding(
@@ -67,7 +67,7 @@ class Agent(nn.Module):
             padding_idx=self.ePAD
         )
         self.entity_init_method(self.entity_embedding_1.weight)
-        self.entity_embedding_1.weight.requires_grad = self.train_entities
+        self.entity_embedding_1.weight.requires_grad = True if self.train_entities == 1 else False
 
         self.entity_embedding_2 = nn.Embedding(
             self.entity_vocab_size,
@@ -75,7 +75,7 @@ class Agent(nn.Module):
             padding_idx=self.ePAD
         )
         self.entity_init_method(self.entity_embedding_2.weight)
-        self.entity_embedding_2.weight.requires_grad = self.train_entities
+        self.entity_embedding_2.weight.requires_grad = True if self.train_entities == 1 else False
 
     def define_agents_policy(self):
         # Create LSTM cells for each agent
