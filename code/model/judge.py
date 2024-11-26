@@ -31,7 +31,7 @@ class Judge(nn.Module):
             _weight=self._get_xavier_initialization(
                 self.action_vocab_size, self.embedding_size)
         )
-        self.relation_embedding.weight.requires_grad = self.train_relations
+        self.relation_embedding.weight.requires_grad = True if self.train_relations == 1 else False
 
         # Entity embedding initialization
         if self.use_entity_embeddings:
@@ -48,7 +48,7 @@ class Judge(nn.Module):
                 _weight=torch.zeros(self.entity_vocab_size,
                                     self.embedding_size)
             )
-        self.entity_embedding.weight.requires_grad = self.train_entities
+        self.entity_embedding.weight.requires_grad = True if self.train_entities == 1 else False
 
         # Classifier MLP
         mlp_layers = []
