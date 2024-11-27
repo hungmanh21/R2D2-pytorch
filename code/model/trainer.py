@@ -168,7 +168,7 @@ class Trainer:
 
         return entropy_1, entropy_2
 
-    def train(self, sess):
+    def train(self):
         """
         Train the model.
         """
