@@ -62,8 +62,8 @@ class Trainer:
         # Set random seeds if provided
         if self.seed is not None:
             print("SEED :", self.seed)
-            torch.manual_seed(self.seed)
-            np.random.seed(self.seed)
+            torch.manual_seed(self.seed[0])
+            np.random.seed(self.seed[0])
 
         self.batch_size = self.batch_size * \
             (1 + self.false_facts_train) * self.num_rollouts
