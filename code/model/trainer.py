@@ -200,6 +200,12 @@ class Trainer:
             all_rewards = []
             all_rewards_before_baseline = []
 
+            temp_batch_size = episode.no_examples
+            pro_memory = self.agent.get_init_state_array(temp_batch_size)[
+                0].to(self.device)
+            con_memory = self.agent.get_init_state_array(temp_batch_size)[
+                1].to(self.device)
+
             debate_printer.create_debates(
                 query_subjects.cpu().numpy(),
                 query_relations.cpu().numpy(),
@@ -217,7 +223,8 @@ class Trainer:
                     # Convert state tensors to device
                     next_relations = state['next_relations'].to(self.device)
                     next_entities = state['next_entities'].to(self.device)
-                    current_entities = state['current_entities'].to(self.device)
+                    current_entities = state['current_entities'].to(
+                        self.device)
 
                     # Execute step
                     loss, pro_memory, con_memory, logits, action_idx, rewards, print_rewards = self.agent.step(
@@ -259,7 +266,8 @@ class Trainer:
                     # Similar process for con agent...
                     next_relations = state['next_relations'].to(self.device)
                     next_entities = state['next_entities'].to(self.device)
-                    current_entities = state['current_entities'].to(self.device)
+                    current_entities = state['current_entities'].to(
+                        self.device)
 
                     loss, pro_memory, con_memory, logits, action_idx, rewards, print_rewards = self.agent.step(
                         next_relations,
@@ -412,9 +420,11 @@ class Trainer:
 
                     # Pro agent turn
                     for path_num in range(self.path_length):
-                        next_relations = state['next_relations'].to(self.device)
+                        next_relations = state['next_relations'].to(
+                            self.device)
                         next_entities = state['next_entities'].to(self.device)
-                        current_entities = state['current_entities'].to(self.device)
+                        current_entities = state['current_entities'].to(
+                            self.device)
 
                         _, pro_memory, con_memory, _, action_idx, rewards, _ = self.agent.step(
                             next_relations,
@@ -442,9 +452,11 @@ class Trainer:
                     state = episode.reset_initial_state()
                     for path_num in range(self.path_length):
                         # Similar process for con agent...
-                        next_relations = state['next_relations'].to(self.device)
+                        next_relations = state['next_relations'].to(
+                            self.device)
                         next_entities = state['next_entities'].to(self.device)
-                        current_entities = state['current_entities'].to(self.device)
+                        current_entities = state['current_entities'].to(
+                            self.device)
 
                         _, pro_memory, con_memory, _, action_idx, rewards, _ = self.agent.step(
                             next_relations,
