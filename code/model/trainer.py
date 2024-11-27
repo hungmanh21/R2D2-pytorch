@@ -202,9 +202,9 @@ class Trainer:
 
             temp_batch_size = episode.no_examples
             pro_memory = self.agent.get_init_state_array(temp_batch_size)[
-                0].to(self.device)
+                0]
             con_memory = self.agent.get_init_state_array(temp_batch_size)[
-                1].to(self.device)
+                1]
 
             debate_printer.create_debates(
                 query_subjects.cpu().numpy(),
