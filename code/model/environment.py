@@ -1,228 +1,261 @@
+"""
+PyTorch implementation of R2D2 (Reinforcement Learning with Debate)
+Original TensorFlow implementation adapted to PyTorch while maintaining functionality.
+"""
+
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 import numpy as np
+from typing import Dict, List, Tuple, Optional
+import logging
+
 from code.data.feed_data import RelationEntityBatcher
 from code.data.grapher import RelationEntityGrapher
-import logging
 
 logger = logging.getLogger()
 
 
-class Episode:
+class Episode(nn.Module):
     """
     Class representing an episode for reinforcement learning.
+    Converted from TensorFlow to PyTorch implementation.
     """
 
     def __init__(self, graph, data, params):
         """
         Initializes an episode.
-
-        :param graph: RelationEntityGrapher. Graph for the episode defining the available actions.
-        :param data: Tuple. Contains query subjects, relations, objects, labels, and all correct answers.
-        :param params: Tuple. Number of rollouts and mode ('train', 'test', or 'dev').
+        
+        Args:
+            graph: RelationEntityGrapher object
+            data: Tuple containing (start_entities, query_relation, end_entities, labels, all_answers)
+            params: Tuple containing (num_rollouts, mode)
         """
-        self.device = torch.device(
-            'cuda' if torch.cuda.is_available() else 'cpu')
+        super(Episode, self).__init__()
         self.grapher = graph
-        num_rollouts, mode = params
-        self.mode = mode
-        self.num_rollouts = num_rollouts
+        self.num_rollouts, self.mode = params
         self.current_hop = 0
 
         start_entities, query_relation, end_entities, labels, all_answers = data
         self.no_examples = start_entities.shape[0]
 
-        start_entities = np.repeat(start_entities, self.num_rollouts)
-        query_relation = np.repeat(query_relation, self.num_rollouts)
-        end_entities = np.repeat(end_entities, self.num_rollouts)
-        labels = np.repeat(labels, self.num_rollouts)
+        # Convert numpy arrays to PyTorch tensors
+        start_entities = torch.from_numpy(
+            np.repeat(start_entities, self.num_rollouts))
+        batch_query_relation = torch.from_numpy(
+            np.repeat(query_relation, self.num_rollouts))
+        end_entities = torch.from_numpy(
+            np.repeat(end_entities, self.num_rollouts))
 
-        self.start_entities = torch.tensor(
-            start_entities, dtype=torch.long, device=self.device)
-        self.end_entities = torch.tensor(
-            end_entities, dtype=torch.long, device=self.device)
-        self.current_entities = self.start_entities.clone()
-        self.query_relation = torch.tensor(
-            query_relation, dtype=torch.long, device=self.device)
-        self.labels = torch.tensor(
-            labels, dtype=torch.float32, device=self.device).unsqueeze(1)
-        self.all_answers = all_answers  # Keep as NumPy if needed by grapher
+        self.start_entities = start_entities
+        self.end_entities = end_entities
+        self.current_entities = start_entities.clone()
+        self.query_relation = batch_query_relation
+        self.all_answers = all_answers
+        self.labels = torch.from_numpy(np.repeat(labels, self.num_rollouts))
 
+        # Get next actions from grapher
         next_actions = self.grapher.return_next_actions(
-            self.current_entities.cpu().numpy(),
-            self.start_entities.cpu().numpy(),
-            self.query_relation.cpu().numpy(),
-            self.end_entities.cpu().numpy(),
-            self.labels.cpu().numpy(),
+            self.current_entities.numpy(),
+            self.start_entities.numpy(),
+            self.query_relation.numpy(),
+            self.end_entities.numpy(),
+            self.labels.numpy(),
             self.all_answers,
-            self.num_rollouts,
+            self.num_rollouts
         )
 
-        self.state = self._process_state(next_actions)
+        # Convert to PyTorch tensors and store state
+        next_actions = torch.from_numpy(next_actions)
+        self.state = {
+            'next_relations': next_actions[:, :, 1],
+            'next_entities': torch.where(
+                next_actions[:, :, 0] == self.start_entities.unsqueeze(
+                    -1).expand(-1, next_actions.shape[1]),
+                torch.tensor(self.grapher.get_placeholder_subject()),
+                next_actions[:, :, 0]
+            ),
+            'current_entities': torch.where(
+                self.current_entities == self.start_entities,
+                torch.tensor(self.grapher.get_placeholder_subject()),
+                self.current_entities
+            )
+        }
+
         self.init_state = dict(self.state)
 
-    def _process_state(self, next_actions):
-        """
-        Processes the next actions and prepares the episode state.
-
-        :param next_actions: NumPy array of next actions.
-        :return: Dictionary with next relations, next entities, and current entities.
-        """
-        next_relations = torch.tensor(
-            next_actions[:, :, 1], dtype=torch.long, device=self.device)
-        next_entities = torch.tensor(
-            next_actions[:, :, 0], dtype=torch.long, device=self.device)
-
-        start_mask = torch.tensor(
-            next_actions[:, :, 0] == np.expand_dims(
-                self.start_entities.cpu().numpy(), axis=-1),
-            dtype=torch.bool,
-            device=self.device,
-        )
-        current_mask = self.current_entities == self.start_entities
-
-        state = {
-            "next_relations": next_relations,
-            "next_entities": torch.where(
-                start_mask, self.grapher.get_placeholder_subject(), next_entities
-            ),
-            "current_entities": torch.where(
-                current_mask, self.grapher.get_placeholder_subject(), self.current_entities
-            ),
-        }
-        return state
-
-    def reset_initial_state(self):
-        """
-        Resets the state to the initial configuration.
-        """
+    def reset_initial_state(self) -> Dict:
+        """Returns the initial state of the episode."""
         self.state = dict(self.init_state)
         return self.state
 
-    def get_query_relation(self):
-        """
-        Getter for the query's relations for the episode.
-        """
+    def get_query_relation(self) -> torch.Tensor:
+        """Returns the query relations for the episode."""
         return self.query_relation
 
-    def get_query_subjects(self):
-        """
-        Getter for the query's subjects of the episode.
-        """
+    def get_default_query_subject(self) -> str:
+        """Returns the placeholder string for query subject."""
+        return self.grapher.QUERY_SUBJECT_NAME
+
+    def get_query_subjects(self) -> torch.Tensor:
+        """Returns the query subjects."""
         return self.start_entities
 
-    def get_query_objects(self):
-        """
-        Getter for the query's objects of the episode.
-        """
+    def get_query_objects(self) -> torch.Tensor:
+        """Returns the query objects."""
         return self.end_entities
 
-    def get_labels(self):
-        """
-        Getter for the query's labels of the episode.
-        """
-        return self.labels
+    def get_labels(self) -> torch.Tensor:
+        """Returns the query labels reshaped to [batch_size, 1]."""
+        return self.labels.unsqueeze(1)
 
-    def get_rewards(self, logits_sequence):
+    def get_rewards(self, logits_sequence: List[Tuple[int, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Computes and returns rewards for the episode.
+        Computes rewards for the agents based on logits sequence.
+        
+        Args:
+            logits_sequence: List of tuples (agent_id, logit_value)
+            
+        Returns:
+            Tuple of rewards for both agents
+        """
+        rewards_1 = []
+        rewards_2 = []
 
-        :param logits_sequence: List of tuples with logits for agent actions.
-        :return: Tuple of rewards for agents.
-        """
-        rewards_1, rewards_2 = [], []
         for which_agent, logit in logits_sequence:
-            if which_agent == 0:
+            if not which_agent:
                 rewards_1.append(logit)
             else:
                 rewards_2.append(logit)
 
-        rewards_1 = torch.stack(rewards_1, dim=1).squeeze(-1)
-        rewards_2 = -torch.stack(rewards_2, dim=1).squeeze(-1)
+        rewards_1 = torch.stack(rewards_1, dim=1)
+        rewards_2 = torch.stack(rewards_2, dim=1)
+
+        rewards_1 = rewards_1.squeeze(-1)
+        rewards_2 = -rewards_2.squeeze(-1)
 
         return rewards_1, rewards_2
 
-    def __call__(self, action):
+    def __call__(self, action: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        Simulates a transition on the graph defined by the action.
-
-        :param action: Torch tensor, [batch_size]. Action indices.
-        :return: Updated state of the episode.
+        Processes a transition in the environment based on action.
+        
+        Args:
+            action: Tensor of actions to take
+            
+        Returns:
+            Updated state dictionary
         """
         self.current_hop += 1
+
+        # Handle next entities selection
         true_next_entities = torch.where(
-            self.state["next_entities"] == self.grapher.get_placeholder_subject(),
-            self.start_entities.unsqueeze(-1),
-            self.state["next_entities"],
+            self.state['next_entities'] == self.grapher.get_placeholder_subject(),
+            self.start_entities.unsqueeze(-1).expand(-1,
+                                                     self.state['next_entities'].shape[1]),
+            self.state['next_entities']
         )
 
-        self.current_entities = true_next_entities[
-            torch.arange(self.no_examples * self.num_rollouts,
-                         device=self.device), action
-        ]
+        # Update current entities based on action
+        batch_indices = torch.arange(self.no_examples * self.num_rollouts)
+        self.current_entities = true_next_entities[batch_indices, action]
 
+        # Get next actions from grapher
         next_actions = self.grapher.return_next_actions(
-            self.current_entities.cpu().numpy(),
-            self.start_entities.cpu().numpy(),
-            self.query_relation.cpu().numpy(),
-            self.end_entities.cpu().numpy(),
-            self.labels.cpu().numpy(),
+            self.current_entities.numpy(),
+            self.start_entities.numpy(),
+            self.query_relation.numpy(),
+            self.end_entities.numpy(),
+            self.labels.numpy(),
             self.all_answers,
-            self.num_rollouts,
+            self.num_rollouts
         )
 
-        self.state = self._process_state(next_actions)
+        next_actions = torch.from_numpy(next_actions)
+
+        # Update state
+        self.state['next_relations'] = next_actions[:, :, 1]
+        self.state['next_entities'] = torch.where(
+            next_actions[:, :, 0] == self.start_entities.unsqueeze(
+                -1).expand(-1, next_actions.shape[1]),
+            torch.tensor(self.grapher.get_placeholder_subject()),
+            next_actions[:, :, 0]
+        )
+        self.state['current_entities'] = torch.where(
+            self.current_entities == self.start_entities,
+            torch.tensor(self.grapher.get_placeholder_subject()),
+            self.current_entities
+        )
+
         return self.state
 
 
-class env:
+class Environment:
     """
-    Class representing an environment for the model.
+    PyTorch implementation of the R2D2 environment.
+    Handles episode generation and management.
     """
 
-    def __init__(self, params, mode="train"):
+    def __init__(self, params: Dict, mode: str = 'train'):
         """
         Initializes the environment.
-
-        :param params: Dictionary of experiment parameters.
-        :param mode: Mode ('train', 'test', or 'dev') for the environment.
+        
+        Args:
+            params: Dictionary of parameters
+            mode: Either 'train', 'test' or 'dev'
         """
-        self.num_rollouts = params["num_rollouts"]
+        self.num_rollouts = params['num_rollouts']
         self.mode = mode
-        self.test_rollouts = params["test_rollouts"]
-        self.rounds_sub_training = params["rounds_sub_training"]
+        self.test_rollouts = params['test_rollouts']
+        self.rounds_sub_training = params['rounds_sub_training']
+        input_dir = params['data_input_dir']
 
-        input_dir = params["data_input_dir"]
-        self.batcher = RelationEntityBatcher(
-            input_dir=input_dir,
-            batch_size=params["batch_size"],
-            entity_vocab=params["entity_vocab"],
-            relation_vocab=params["relation_vocab"],
-            is_use_fixed_false_facts=params["is_use_fixed_false_facts"],
-            num_false_facts=params["false_facts_train"] if mode == "train" else 0,
-            mode=mode,
-        )
+        # Initialize batcher based on mode
+        if mode == 'train':
+            self.batcher = RelationEntityBatcher(
+                input_dir=input_dir,
+                batch_size=params['batch_size'],
+                entity_vocab=params['entity_vocab'],
+                relation_vocab=params['relation_vocab'],
+                is_use_fixed_false_facts=params['is_use_fixed_false_facts'],
+                num_false_facts=params['false_facts_train'],
+                rounds_sub_training=self.rounds_sub_training
+            )
+        else:
+            self.batcher = RelationEntityBatcher(
+                input_dir=input_dir,
+                batch_size=params['batch_size'],
+                entity_vocab=params['entity_vocab'],
+                relation_vocab=params['relation_vocab'],
+                is_use_fixed_false_facts=params['is_use_fixed_false_facts'],
+                mode=mode
+            )
 
+        # Initialize grapher
         self.grapher = RelationEntityGrapher(
-            data_input_dir=params["data_input_dir"],
+            data_input_dir=params['data_input_dir'],
             mode=mode,
-            max_num_actions=params["max_num_actions"],
-            entity_vocab=params["entity_vocab"],
-            relation_vocab=params["relation_vocab"],
-            mid_to_name=params["mid_to_name"],
+            max_num_actions=params['max_num_actions'],
+            entity_vocab=params['entity_vocab'],
+            relation_vocab=params['relation_vocab'],
+            mid_to_name=params['mid_to_name']
         )
 
     def get_episodes(self):
         """
-        Yields episodes from the environment.
+        Generator that yields episodes.
+        
+        Yields:
+            Episode objects for either training or testing
         """
-        params = (self.num_rollouts, self.mode) if self.mode == "train" else (
-            self.test_rollouts, self.mode)
-
-        for data in (
-            self.batcher.yield_next_batch_train()
-            if self.mode == "train"
-            else self.batcher.yield_next_batch_test()
-        ):
-            if data is None:
-                return
-            yield Episode(self.grapher, data, params)
+        if self.mode == 'train':
+            params = (self.num_rollouts, self.mode)
+            for data in self.batcher.yield_next_batch_train():
+                yield Episode(self.grapher, data, params)
+        else:
+            params = (self.test_rollouts, self.mode)
+            for data in self.batcher.yield_next_batch_test():
+                if data is None:
+                    return
+                yield Episode(self.grapher, data, params)
