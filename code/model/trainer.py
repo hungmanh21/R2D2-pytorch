@@ -691,7 +691,7 @@ def main():
             if isinstance(value, list):
                 options[key] = value[0]
         trainer = Trainer(options, best_metric)
-        trainer.to(device)
+        # trainer.to(device)
 
         # Train model
         trainer.train()
