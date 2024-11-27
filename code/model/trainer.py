@@ -683,8 +683,8 @@ def main():
         options['mid_to_name'] = mid_to_name
         options['device'] = device
 
-        with open(os.path.join(output_dir, 'config.json'), 'w') as f:
-            json.dump(options, f, indent=4)
+        # with open(os.path.join(output_dir, 'config.json'), 'w') as f:
+        #     json.dump(options, f, indent=4)
 
         # Initialize trainer
         for key, value in options.items():
