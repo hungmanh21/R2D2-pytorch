@@ -215,12 +215,9 @@ class Trainer:
                     which_agent_list.append(0.0)
 
                     # Convert state tensors to device
-                    next_relations = torch.from_numpy(
-                        state['next_relations']).to(self.device)
-                    next_entities = torch.from_numpy(
-                        state['next_entities']).to(self.device)
-                    current_entities = torch.from_numpy(
-                        state['current_entities']).to(self.device)
+                    next_relations = state['next_relations'].to(self.device)
+                    next_entities = state['next_entities'].to(self.device)
+                    current_entities = state['current_entities'].to(self.device)
 
                     # Execute step
                     loss, pro_memory, con_memory, logits, action_idx, rewards, print_rewards = self.agent.step(
@@ -260,12 +257,9 @@ class Trainer:
                     which_agent_list.append(1.0)
 
                     # Similar process for con agent...
-                    next_relations = torch.from_numpy(
-                        state['next_relations']).to(self.device)
-                    next_entities = torch.from_numpy(
-                        state['next_entities']).to(self.device)
-                    current_entities = torch.from_numpy(
-                        state['current_entities']).to(self.device)
+                    next_relations = state['next_relations'].to(self.device)
+                    next_entities = state['next_entities'].to(self.device)
+                    current_entities = state['current_entities'].to(self.device)
 
                     loss, pro_memory, con_memory, logits, action_idx, rewards, print_rewards = self.agent.step(
                         next_relations,
@@ -418,12 +412,9 @@ class Trainer:
 
                     # Pro agent turn
                     for path_num in range(self.path_length):
-                        next_relations = torch.from_numpy(
-                            state['next_relations']).to(self.device)
-                        next_entities = torch.from_numpy(
-                            state['next_entities']).to(self.device)
-                        current_entities = torch.from_numpy(
-                            state['current_entities']).to(self.device)
+                        next_relations = state['next_relations'].to(self.device)
+                        next_entities = state['next_entities'].to(self.device)
+                        current_entities = state['current_entities'].to(self.device)
 
                         _, pro_memory, con_memory, _, action_idx, rewards, _ = self.agent.step(
                             next_relations,
@@ -451,12 +442,9 @@ class Trainer:
                     state = episode.reset_initial_state()
                     for path_num in range(self.path_length):
                         # Similar process for con agent...
-                        next_relations = torch.from_numpy(
-                            state['next_relations']).to(self.device)
-                        next_entities = torch.from_numpy(
-                            state['next_entities']).to(self.device)
-                        current_entities = torch.from_numpy(
-                            state['current_entities']).to(self.device)
+                        next_relations = state['next_relations'].to(self.device)
+                        next_entities = state['next_entities'].to(self.device)
+                        current_entities = state['current_entities'].to(self.device)
 
                         _, pro_memory, con_memory, _, action_idx, rewards, _ = self.agent.step(
                             next_relations,
