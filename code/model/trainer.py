@@ -34,11 +34,12 @@ from code.model.debate_printer import Debate_Printer
 logger = logging.getLogger()
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
+
 class Trainer:
     '''
     Central class for R2D2 implemented in PyTorch. The trainer handles all components of the model and manages training/testing.
     '''
-    
+
     def __init__(self, params, best_metric):
         '''
         Initialize the trainer with given parameters and best metric.
@@ -46,22 +47,24 @@ class Trainer:
         # Transfer parameters to self
         for key, val in params.items():
             setattr(self, key, val)
-        
+
         self.set_random_seeds(self.seed)
-        self.batch_size = self.batch_size * (1 + self.false_facts_train) * self.num_rollouts
-        
+        self.batch_size = self.batch_size * \
+            (1 + self.false_facts_train) * self.num_rollouts
+
         # Initialize device
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
+        self.device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
+
         # Initialize models
         self.judge = Judge(params).to(self.device)
         self.agent = Agent(params, self.judge).to(self.device)
-        
+
         # Initialize environments
         self.train_environment = env(params, 'train')
         self.dev_test_environment = env(params, 'dev')
         self.test_test_environment = env(params, 'test')
-        
+
         self.number_steps = self.path_length * self.number_arguments * 2
         self.best_metric = best_metric
 
@@ -69,12 +72,13 @@ class Trainer:
         self.learning_rate_judge_init = params['learning_rate_judge']
         self.baseline_1 = ReactiveBaseline(l=self.Lambda)
         self.baseline_2 = ReactiveBaseline(l=self.Lambda)
-        
+
         # Initialize optimizers
-        self.optimizer_judge = Adam(self.judge.parameters(), lr=self.learning_rate_judge_init)
+        self.optimizer_judge = Adam(
+            self.judge.parameters(), lr=self.learning_rate_judge_init)
         self.optimizer_agents = Adam(
-            list(self.agent.policy_agent_1_cells.parameters()) + 
-            list(self.agent.policy_agent_2_cells.parameters()), 
+            list(self.agent.policy_agent_1_cells.parameters()) +
+            list(self.agent.policy_agent_2_cells.parameters()),
             lr=self.learning_rate_agents
         )
 
@@ -88,15 +92,15 @@ class Trainer:
             random.seed(seed)
             torch.backends.cudnn.deterministic = True
 
-    def calc_reinforce_loss(self, per_example_loss, which_agent_sequence, 
-                          cum_discounted_reward_1, cum_discounted_reward_2, per_example_logits):
+    def calc_reinforce_loss(self, per_example_loss, which_agent_sequence,
+                            cum_discounted_reward_1, cum_discounted_reward_2, per_example_logits):
         '''Calculate REINFORCE loss for both agents'''
-        
+
         # Stack losses and create masks
         loss = torch.stack(per_example_loss, dim=1)  # [B, T]
         mask = torch.tensor(which_agent_sequence).bool().to(self.device)
         mask = mask.expand(loss.size(0), -1)
-        
+
         # Split losses by agent
         loss_1 = loss.masked_select(~mask).view(loss.size(0), -1)
         loss_2 = loss.masked_select(mask).view(loss.size(0), -1)
@@ -108,20 +112,23 @@ class Trainer:
         else:
             baseline_1 = self.baseline_1.get_baseline_value()
             baseline_2 = self.baseline_2.get_baseline_value()
-            
+
             final_reward_1 = cum_discounted_reward_1 - baseline_1
             final_reward_2 = cum_discounted_reward_2 - baseline_2
 
         # Normalize rewards
-        final_reward_1 = (final_reward_1 - final_reward_1.mean()) / (final_reward_1.std() + 1e-6)
-        final_reward_2 = (final_reward_2 - final_reward_2.mean()) / (final_reward_2.std() + 1e-6)
+        final_reward_1 = (final_reward_1 - final_reward_1.mean()
+                          ) / (final_reward_1.std() + 1e-6)
+        final_reward_2 = (final_reward_2 - final_reward_2.mean()
+                          ) / (final_reward_2.std() + 1e-6)
 
         # Calculate losses with rewards
         loss_1 = torch.mul(loss_1, final_reward_1)
         loss_2 = torch.mul(loss_2, final_reward_2)
 
         # Add entropy regularization
-        entropy_1, entropy_2 = self.entropy_reg_loss(per_example_logits, which_agent_sequence)
+        entropy_1, entropy_2 = self.entropy_reg_loss(
+            per_example_logits, which_agent_sequence)
         total_loss_1 = loss_1.mean() - self.decaying_beta * entropy_1
         total_loss_2 = loss_2.mean() - self.decaying_beta * entropy_2
 
@@ -132,41 +139,52 @@ class Trainer:
         logits = torch.stack(all_logits, dim=2)  # [B, MAX_NUM_ACTIONS, T]
         mask = torch.tensor(which_agent_sequence).bool().to(self.device)
         mask = mask.expand(logits.size(0), logits.size(1), -1)
-        
+
         # Split logits by agent
-        logits_1 = logits.masked_select(~mask).view(logits.size(0), logits.size(1), -1)
-        logits_2 = logits.masked_select(mask).view(logits.size(0), logits.size(1), -1)
-        
+        logits_1 = logits.masked_select(~mask).view(
+            logits.size(0), logits.size(1), -1)
+        logits_2 = logits.masked_select(mask).view(
+            logits.size(0), logits.size(1), -1)
+
         # Calculate entropy
-        entropy_1 = -(F.softmax(logits_1, dim=1) * F.log_softmax(logits_1, dim=1)).sum(dim=1).mean()
-        entropy_2 = -(F.softmax(logits_2, dim=1) * F.log_softmax(logits_2, dim=1)).sum(dim=1).mean()
-        
+        entropy_1 = -(F.softmax(logits_1, dim=1) *
+                      F.log_softmax(logits_1, dim=1)).sum(dim=1).mean()
+        entropy_2 = -(F.softmax(logits_2, dim=1) *
+                      F.log_softmax(logits_2, dim=1)).sum(dim=1).mean()
+
         return entropy_1, entropy_2
 
     def train(self, epochs):
         '''Main training loop'''
         self.batch_counter = 0
-        
-        debate_printer = Debate_Printer(self.output_dir, self.train_environment.grapher, self.num_rollouts)
-        
+
+        debate_printer = Debate_Printer(
+            self.output_dir, self.train_environment.grapher, self.num_rollouts)
+
         for epoch in range(epochs):
             for episode in self.train_environment.get_episodes():
                 # Determine if we're training judge or agents
                 is_train_judge = (self.batch_counter // self.train_judge_every) % 2 == 0 \
-                                or self.batch_counter >= self.rounds_sub_training
-                
+                    or self.batch_counter >= self.rounds_sub_training
+
                 logger.info(f"BATCH COUNTER: {self.batch_counter}")
                 self.batch_counter += 1
 
                 # Get episode data
-                query_subjects = torch.tensor(episode.get_query_subjects()).to(self.device)
-                query_relation = torch.tensor(episode.get_query_relation()).to(self.device)
-                query_objects = torch.tensor(episode.get_query_objects()).to(self.device)
-                episode_answers = torch.tensor(episode.get_labels()).to(self.device)
+                query_subjects = torch.tensor(
+                    episode.get_query_subjects()).to(self.device)
+                query_relation = torch.tensor(
+                    episode.get_query_relation()).to(self.device)
+                query_objects = torch.tensor(
+                    episode.get_query_objects()).to(self.device)
+                episode_answers = torch.tensor(
+                    episode.get_labels()).to(self.device)
 
                 # Set embeddings
-                self.judge.set_query_embeddings(query_subjects, query_relation, query_objects)
-                self.agent.set_query_embeddings(query_subjects, query_relation, query_objects)
+                self.judge.set_query_embeddings(
+                    query_subjects, query_relation, query_objects)
+                self.agent.set_query_embeddings(
+                    query_subjects, query_relation, query_objects)
 
                 debate_printer.create_debates(
                     episode.get_query_subjects(),
@@ -184,7 +202,7 @@ class Trainer:
                 action_idx = []
                 rewards_agents = []
                 rewards_before_baseline = []
-                
+
                 for arguments in range(self.number_arguments):
                     # Pro agent's turn
                     state = episode.reset_initial_state()
@@ -221,25 +239,27 @@ class Trainer:
                 # Calculate final judge outputs
                 judge_outputs = self.judge(logits)
                 logits_judge = judge_outputs['final_logits']
-                debate_printer.set_debates_final_logit(logits_judge.detach().cpu().numpy())
+                debate_printer.set_debates_final_logit(
+                    logits_judge.detach().cpu().numpy())
 
                 # Training step
                 if is_train_judge:
                     loss_judge = judge_outputs['loss']
                     self.optimizer_judge.zero_grad()
                     loss_judge.backward()
-                    torch.nn.utils.clip_grad_norm_(self.judge.parameters(), self.grad_clip_norm)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.judge.parameters(), self.grad_clip_norm)
                     self.optimizer_judge.step()
                 else:
                     # Train agents
                     rewards_1, rewards_2 = episode.get_rewards(logits)
                     rewards_1 = torch.tensor(rewards_1).to(self.device)
                     rewards_2 = torch.tensor(rewards_2).to(self.device)
-                    
+
                     cum_discounted_reward_1, cum_discounted_reward_2 = self.calc_cum_discounted_reward(
                         rewards_1, rewards_2, np.array(which_agent_list)
                     )
-                    
+
                     loss_1, loss_2 = self.calc_reinforce_loss(
                         per_example_loss,
                         which_agent_list,
@@ -247,11 +267,11 @@ class Trainer:
                         cum_discounted_reward_2,
                         per_example_logits
                     )
-                    
+
                     self.optimizer_agents.zero_grad()
                     (loss_1 + loss_2).backward()
                     torch.nn.utils.clip_grad_norm_(
-                        list(self.agent.policy_agent_1_cells.parameters()) + 
+                        list(self.agent.policy_agent_1_cells.parameters()) +
                         list(self.agent.policy_agent_2_cells.parameters()),
                         self.grad_clip_norm
                     )
@@ -270,7 +290,8 @@ class Trainer:
                     }, f"{self.model_dir}/unbiased_model/unbiased_model.pt")
 
                 if os.name == 'posix':
-                    logger.info('Memory usage : %s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+                    logger.info('Memory usage : %s (kb)' %
+                                resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
 
                 gc.collect()
                 if self.batch_counter >= self.total_iterations:
@@ -280,8 +301,9 @@ class Trainer:
         '''Execute a single step for an agent'''
         next_relations = torch.tensor(state['next_relations']).to(self.device)
         next_entities = torch.tensor(state['next_entities']).to(self.device)
-        current_entities = torch.tensor(state['current_entities']).to(self.device)
-        
+        current_entities = torch.tensor(
+            state['current_entities']).to(self.device)
+
         outputs = self.agent(
             which_agent=which_agent,
             next_relations=next_relations,
@@ -291,20 +313,20 @@ class Trainer:
             query_relation=query_relation,
             query_object=query_objects
         )
-        
+
         return outputs['loss'], outputs['logits'], outputs['action_idx'], \
-               outputs['rewards'], outputs['rewards_before_baseline']
+            outputs['rewards'], outputs['rewards_before_baseline']
 
     def test(self, is_dev_environment, save_model=False, best_threshold=None):
         '''Test the model'''
         self.agent.eval()
         self.judge.eval()
-        
+
         total_examples = 0
         mean_probs_list = []
         correct_answer_list = []
         environment = self.dev_test_environment if is_dev_environment else self.test_test_environment
-        
+
         metrics = {
             'hits@20': 0,
             'hits@10': 0,
@@ -313,20 +335,24 @@ class Trainer:
             'mrr': 0,
             'mr': 0
         }
-        
+
         with torch.no_grad():
             for episode in tqdm(environment.get_episodes()):
                 # Process episode
-                query_subjects = torch.tensor(episode.get_query_subjects()).to(self.device)
-                query_relation = torch.tensor(episode.get_query_relation()).to(self.device)
-                query_objects = torch.tensor(episode.get_query_objects()).to(self.device)
-                episode_answers = torch.tensor(episode.get_labels()).to(self.device)
-                
+                query_subjects = torch.tensor(
+                    episode.get_query_subjects()).to(self.device)
+                query_relation = torch.tensor(
+                    episode.get_query_relation()).to(self.device)
+                query_objects = torch.tensor(
+                    episode.get_query_objects()).to(self.device)
+                episode_answers = torch.tensor(
+                    episode.get_labels()).to(self.device)
+
                 # Test episode
                 logits_judge = self.test_episode(
                     episode, query_subjects, query_relation, query_objects, episode_answers
                 )
-                
+
                 # Update metrics
                 probs_judge = torch.sigmoid(logits_judge)
                 mean_probs = probs_judge.mean(dim=1, keepdim=True)
@@ -654,6 +680,9 @@ def main():
             # Setup output directories and logging
             permutation['output_dir'] = setup_directories(
                 permutation, current_time)
+            permutation['relation_vocab'] = relation_vocab
+            permutation['entity_vocab'] = entity_vocab
+            permutation['mid_to_name'] = mid_to_name
             setup_logging(permutation, fmt)
 
             # Initialize and train model
