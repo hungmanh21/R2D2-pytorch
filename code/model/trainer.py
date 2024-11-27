@@ -681,6 +681,7 @@ def main():
         options['relation_vocab'] = relation_vocab
         options['entity_vocab'] = entity_vocab
         options['mid_to_name'] = mid_to_name
+        options['device'] = device
 
         with open(os.path.join(output_dir, 'config.json'), 'w') as f:
             json.dump(options, f, indent=4)
