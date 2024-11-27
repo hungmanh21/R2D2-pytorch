@@ -1,741 +1,575 @@
-"""
-PyTorch implementation of the R2D2 Trainer
-"""
-
-import json
+import datetime
+from pprint import pprint
+import sys
+import uuid
+import sklearn
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-from typing import Dict, List, Tuple, Optional
+from tqdm import tqdm
 import logging
 import os
-import gc
-import datetime
-import uuid
-from pprint import pprint
-from sklearn.metrics import accuracy_score, precision_recall_curve, auc, roc_curve
-from tqdm import tqdm
-
+import json
+import numpy as np
+from sklearn.model_selection import ParameterGrid
 from code.model.agent import Agent
-from code.model.debate_printer import Debate_Printer
 from code.model.environment import Environment
 from code.model.judge import Judge
 from code.options import read_options
-import torch.nn.functional as F
+from debate_printer import Debate_Printer
 
 logger = logging.getLogger()
-
-
-class ReactiveBaseline:
-    """Simple moving average baseline."""
-
-    def __init__(self, l: float):
-        self.l = l
-        self.value = 0.0
-
-    def update(self, new_value: float):
-        self.value = self.l * self.value + (1 - self.l) * new_value
-
-    def get_baseline_value(self) -> float:
-        return self.value
+logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
 
 class Trainer:
-    """
-    PyTorch implementation of the R2D2 Trainer.
-    Coordinates training and evaluation of the debate system.
-    """
-
-    def __init__(self, params: Dict, best_metric: float):
-        """
-        Initialize trainer with parameters and best metric.
-
-        Args:
-            params: Dictionary of training parameters
-            best_metric: Best metric achieved so far
-        """
-        # Transfer parameters to self
-        for key, val in params.items():
-            setattr(self, key, val)
-
-        # Set random seeds if provided
-        if self.seed is not None:
-            print("SEED :", self.seed)
-            torch.manual_seed(self.seed)
-            np.random.seed(self.seed)
-
-        self.batch_size = self.batch_size * \
-            (1 + self.false_facts_train) * self.num_rollouts
-
-        # Initialize models
-        self.judge = Judge(params).to(self.device)
-        self.agent = Agent(params, self.judge).to(self.device)
-
-        # Initialize environments
+    def __init__(self, params, best_metric):
+        self.params = params
+        self.best_metric = best_metric
+        self.batch_size = params['batch_size'] * \
+            (1 + params['false_facts_train']) * params['num_rollouts']
+        self.judge = Judge(params)
+        self.agent = Agent(params, self.judge)
         self.train_environment = Environment(params, 'train')
         self.dev_test_environment = Environment(params, 'dev')
         self.test_test_environment = Environment(params, 'test')
-
-        self.number_steps = self.path_length * self.number_arguments * 2
+        self.number_steps = params['path_length'] * \
+            params['number_arguments'] * 2
         self.best_metric = best_metric
-
-        # Setup optimizers
         self.learning_rate_judge_init = params['learning_rate_judge']
-        self.learning_rate_judge = self.learning_rate_judge_init
-
         self.optimizer_judge = optim.Adam(
-            self.judge.parameters(), lr=self.learning_rate_judge)
+            self.judge.parameters(), lr=self.learning_rate_judge_init)
         self.optimizer_agents = optim.Adam(
-            self.agent.parameters(), lr=self.learning_rate_agents)
+            list(self.agent.parameters()), lr=params['learning_rate_agents'])
 
-        # Setup baselines
-        self.baseline_1 = ReactiveBaseline(l=self.Lambda)
-        self.baseline_2 = ReactiveBaseline(l=self.Lambda)
+    def set_random_seeds(self, seed):
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
-    def calc_reinforce_loss(self, per_example_loss: List[torch.Tensor],
-                            which_agent_sequence: List[torch.Tensor],
-                            per_example_logits: List[torch.Tensor],
-                            cum_discounted_reward_1: torch.Tensor,
-                            cum_discounted_reward_2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Calculate REINFORCE loss for both agents.
-        """
-        # Stack losses and create mask
-        loss = torch.stack(per_example_loss, dim=1)
-        mask = torch.stack([x == 0 for x in which_agent_sequence], dim=1)
-        not_mask = ~mask
-
-        # Split losses by agent
-        loss_1 = loss[not_mask].view(loss.size(0), -1)
-        loss_2 = loss[mask].view(loss.size(0), -1)
-
-        # Calculate rewards
-        if self.custom_baseline:
-            final_reward_1 = cum_discounted_reward_1
-            final_reward_2 = cum_discounted_reward_2
-        else:
-            baseline_1 = self.baseline_1.get_baseline_value()
-            baseline_2 = self.baseline_2.get_baseline_value()
-            final_reward_1 = cum_discounted_reward_1 - baseline_1
-            final_reward_2 = cum_discounted_reward_2 - baseline_2
+    def calc_reinforce_loss(self, rewards_1, rewards_2, which_agent_sequence):
+        rewards_1 = torch.tensor(rewards_1)
+        rewards_2 = torch.tensor(rewards_2)
 
         # Normalize rewards
-        reward_mean_1 = final_reward_1.mean()
-        reward_std_1 = final_reward_1.std() + 1e-6
-        reward_mean_2 = final_reward_2.mean()
-        reward_std_2 = final_reward_2.std() + 1e-6
+        rewards_1 = (rewards_1 - rewards_1.mean()) / (rewards_1.std() + 1e-6)
+        rewards_2 = (rewards_2 - rewards_2.mean()) / (rewards_2.std() + 1e-6)
 
-        final_reward_1 = (final_reward_1 - reward_mean_1) / reward_std_1
-        final_reward_2 = (final_reward_2 - reward_mean_2) / reward_std_2
+        loss_1 = torch.mean(torch.mul(torch.stack(
+            self.per_example_loss[::2]), rewards_1))
+        loss_2 = torch.mean(torch.mul(torch.stack(
+            self.per_example_loss[1::2]), rewards_2))
 
-        # Calculate losses with rewards
-        loss_1 = (loss_1 * final_reward_1).mean()
-        loss_2 = (loss_2 * final_reward_2).mean()
-
-        # Add entropy regularization
-        entropy_1, entropy_2 = self.entropy_reg_loss(per_example_logits)
-        total_loss_1 = loss_1 - self.beta * entropy_1
-        total_loss_2 = loss_2 - self.beta * entropy_2
+        entropy_policy_1, entropy_policy_2 = self.entropy_reg_loss(
+            self.per_example_logits)
+        total_loss_1 = loss_1 - self.params['decaying_beta'] * entropy_policy_1
+        total_loss_2 = loss_2 - self.params['decaying_beta'] * entropy_policy_2
 
         return total_loss_1, total_loss_2
 
-    def entropy_reg_loss(self, all_logits: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Calculate entropy regularization loss for both agents.
-
-        Args:
-            all_logits: List of logits for each step
-
-        Returns:
-            Tuple of entropy values for both agents
-        """
+    def entropy_reg_loss(self, all_logits):
         all_logits = torch.stack(all_logits, dim=2)
-        agent_1_mask = torch.tensor([x == 0 for x in range(
-            all_logits.size(2))], device=all_logits.device)
-        agent_2_mask = ~agent_1_mask
+        mask = torch.tensor(self.which_agent_sequence, dtype=torch.bool)
+        mask = mask.unsqueeze(0).expand(all_logits.size(1), -1)
+        mask = mask.unsqueeze(0).expand(all_logits.size(0), -1, -1)
+        logits_1 = all_logits[~mask].reshape(
+            all_logits.size(0), all_logits.size(1), -1)
+        logits_2 = all_logits[mask].reshape(
+            all_logits.size(0), all_logits.size(1), -1)
 
-        # Get logits for each agent
-        logits_1 = all_logits[:, :, agent_1_mask]
-        logits_2 = all_logits[:, :, agent_2_mask]
+        entropy_policy_1 = - \
+            torch.mean(
+                torch.sum(torch.mul(torch.exp(logits_1), logits_1), dim=1))
+        entropy_policy_2 = - \
+            torch.mean(
+                torch.sum(torch.mul(torch.exp(logits_2), logits_2), dim=1))
 
-        # Calculate entropy
-        probs_1 = torch.softmax(logits_1, dim=1)
-        probs_2 = torch.softmax(logits_2, dim=1)
+        return entropy_policy_1, entropy_policy_2
 
-        entropy_1 = -(probs_1 * logits_1).sum(dim=1).mean()
-        entropy_2 = -(probs_2 * logits_2).sum(dim=1).mean()
+    def initialize(self, restore=None):
+        self.which_agent_sequence = []
+        self.candidate_relation_sequence = []
+        self.candidate_entity_sequence = []
+        self.input_path = []
+        self.entity_sequence = []
 
-        return entropy_1, entropy_2
+        self.query_subject = torch.zeros(self.batch_size, dtype=torch.long)
+        self.query_relation = torch.zeros(self.batch_size, dtype=torch.long)
+        self.query_object = torch.zeros(self.batch_size, dtype=torch.long)
+        self.labels = torch.zeros(self.batch_size, 1, dtype=torch.float32)
+        self.judge.set_labels_placeholder(self.labels)
+
+        self.random_flag = torch.tensor(False)
+        self.range_arr = torch.arange(self.batch_size)
+        self.global_step = 0
+        self.decaying_beta = self.params['beta'] * \
+            0.9 ** (self.global_step // 200)
+
+        self.judge.set_query_embeddings(
+            self.query_subject, self.query_relation, self.query_object)
+        self.agent.set_query_embeddings(
+            self.query_subject, self.query_relation, self.query_object)
+
+        for t in range(self.number_steps):
+            which_agent = torch.tensor(0.0)
+            next_possible_relations = torch.zeros(
+                self.batch_size, self.params['max_num_actions'], dtype=torch.long)
+            next_possible_entities = torch.zeros(
+                self.batch_size, self.params['max_num_actions'], dtype=torch.long)
+            input_label_relation = torch.zeros(
+                self.batch_size, dtype=torch.long)
+            start_entities = torch.zeros(self.batch_size, dtype=torch.long)
+            self.which_agent_sequence.append(which_agent)
+            self.input_path.append(input_label_relation)
+            self.candidate_relation_sequence.append(next_possible_relations)
+            self.candidate_entity_sequence.append(next_possible_entities)
+            self.entity_sequence.append(start_entities)
+
+        self.loss_judge, self.final_logits_judge, self.temp_logits_judge, self.per_example_loss, self.per_example_logits, \
+            self.action_idx, self.rewards_agents, self.rewards_before_baseline = self.agent(
+                self.which_agent_sequence, self.candidate_relation_sequence, self.candidate_entity_sequence,
+                self.entity_sequence, self.range_arr, self.number_steps, self.random_flag)
+
+        self.train_judge = self.optimizer_judge.step(self.loss_judge)
+        self.loss_1, self.loss_2 = self.calc_reinforce_loss(
+            self.rewards_agents[::2], self.rewards_agents[1::2], self.which_agent_sequence)
+        self.train_op_1 = self.optimizer_agents.step(self.loss_1)
+        self.train_op_2 = self.optimizer_agents.step(self.loss_2)
 
     def train(self):
-        """
-        Train the model.
-        """
         self.batch_counter = 0
         debate_printer = Debate_Printer(
-            self.output_dir, self.train_environment.grapher, self.num_rollouts)
+            self.params['output_dir'], self.train_environment.grapher, self.params['num_rollouts'])
 
         for episode in self.train_environment.get_episodes():
-            is_train_judge = (self.batch_counter // self.train_judge_every) % 2 == 0 \
-                or self.batch_counter >= self.rounds_sub_training
-
-            logger.info(f"BATCH COUNTER: {self.batch_counter}")
+            is_train_judge = (self.batch_counter // self.params['train_judge_every']
+                              ) % 2 == 0 or self.batch_counter >= self.params['rounds_sub_training']
             self.batch_counter += 1
 
-            # Move episode data to device
-            query_subjects = episode.get_query_subjects().to(self.device)
-            query_relations = episode.get_query_relation().to(self.device)
-            query_objects = episode.get_query_objects().to(self.device)
-            episode_labels = episode.get_labels().to(self.device)
+            episode_answers = episode.get_labels()
+            debate_printer.create_debates(episode.get_query_subjects(
+            ), episode.get_query_relation(), episode.get_query_objects(), episode_answers)
 
-            # Reset gradients
-            self.optimizer_judge.zero_grad() if is_train_judge else self.optimizer_agents.zero_grad()
+            self.query_subject.copy_(episode.get_query_subjects())
+            self.query_relation.copy_(episode.get_query_relation())
+            self.query_object.copy_(episode.get_query_objects())
+            self.labels.copy_(episode_answers)
 
-            # Initialize tracking variables
-            which_agent_list = []
-            all_loss = []
-            all_logits = []
-            action_indices = []
-            all_rewards = []
-            all_rewards_before_baseline = []
+            loss_before_regularization = []
+            logits = []
+            i = 0
+            debate_printer_rel_list = []
+            debate_printer_ent_list = []
 
-            temp_batch_size = episode.no_examples
-            pro_memory = self.agent.get_init_state_array(temp_batch_size)[
-                0]
-            con_memory = self.agent.get_init_state_array(temp_batch_size)[
-                1]
-
-            debate_printer.create_debates(
-                query_subjects.cpu().numpy(),
-                query_relations.cpu().numpy(),
-                query_objects.cpu().numpy(),
-                episode_labels.cpu().numpy()
-            )
-
-            # Execute debate steps
-            for argument in range(self.number_arguments):
-                # Pro agent turn
+            for arguments in range(self.params['number_arguments']):
                 state = episode.reset_initial_state()
-                for path_num in range(self.path_length):
-                    which_agent_list.append(0.0)
-
-                    # Convert state tensors to device
-                    next_relations = state['next_relations'].to(self.device)
-                    next_entities = state['next_entities'].to(self.device)
-                    current_entities = state['current_entities'].to(
-                        self.device)
-
-                    # Execute step
-                    loss, pro_memory, con_memory, logits, action_idx, rewards, print_rewards = self.agent.step(
-                        next_relations,
-                        next_entities,
-                        pro_memory,
-                        con_memory,
-                        current_entities,
-                        which_agent=0.0,
-                        is_random=self.batch_counter < self.train_judge_every
-                    )
-
-                    # Track results
-                    all_loss.append(loss)
-                    all_logits.append(logits)
-                    action_indices.append(action_idx)
-                    all_rewards.append(rewards)
-                    all_rewards_before_baseline.append(print_rewards)
-
-                    # Update state
-                    state = episode(action_idx.cpu().numpy())
-
-                    # Print debate progress
+                for path_num in range(self.params['path_length']):
+                    self.which_agent_sequence[i] = 0.0
+                    self.candidate_relation_sequence[i].copy_(
+                        state['next_relations'])
+                    self.candidate_entity_sequence[i].copy_(
+                        state['next_entities'])
+                    self.entity_sequence[i].copy_(state['current_entities'])
+                    temp_logits_judge, per_example_loss, per_example_logits, idx, rewards, print_rewards = self.agent(
+                        self.candidate_relation_sequence[i], self.candidate_entity_sequence[i], self.agent.get_init_state_array(self.batch_size)[0], self.agent.get_init_state_array(self.batch_size)[1], self.params['prev_relation'], state['current_entities'], self.range_arr, 0.0, self.random_flag)
+                    loss_before_regularization.append(per_example_loss)
                     rel_string, ent_string = debate_printer.get_action_rel_ent(
-                        action_idx.cpu().numpy(),
-                        state
-                    )
-                    debate_printer.create_arguments(
-                        [rel_string], [ent_string],
-                        rewards.cpu().numpy(),
-                        True
-                    )
+                        idx, state)
+                    debate_printer_rel_list.append(rel_string)
+                    debate_printer_ent_list.append(ent_string)
+                    state = episode(idx)
+                    i += 1
+                    logits.append((0, rewards))
 
-                # Con agent turn
+                debate_printer.create_arguments(
+                    debate_printer_rel_list, debate_printer_ent_list, rewards, True)
+                debate_printer_rel_list.clear()
+                debate_printer_ent_list.clear()
+
                 state = episode.reset_initial_state()
-                for path_num in range(self.path_length):
-                    which_agent_list.append(1.0)
-
-                    # Similar process for con agent...
-                    next_relations = state['next_relations'].to(self.device)
-                    next_entities = state['next_entities'].to(self.device)
-                    current_entities = state['current_entities'].to(
-                        self.device)
-
-                    loss, pro_memory, con_memory, logits, action_idx, rewards, print_rewards = self.agent.step(
-                        next_relations,
-                        next_entities,
-                        pro_memory,
-                        con_memory,
-                        current_entities,
-                        which_agent=1.0,
-                        is_random=self.batch_counter < self.train_judge_every
-                    )
-
-                    all_loss.append(loss)
-                    all_logits.append(logits)
-                    action_indices.append(action_idx)
-                    all_rewards.append(rewards)
-                    all_rewards_before_baseline.append(print_rewards)
-
-                    state = episode(action_idx.cpu().numpy())
-
+                for path_num in range(self.params['path_length']):
+                    self.which_agent_sequence[i] = 1.0
+                    self.candidate_relation_sequence[i].copy_(
+                        state['next_relations'])
+                    self.candidate_entity_sequence[i].copy_(
+                        state['next_entities'])
+                    self.entity_sequence[i].copy_(state['current_entities'])
+                    temp_logits_judge, per_example_loss, per_example_logits, idx, rewards, print_rewards = self.agent(
+                        self.candidate_relation_sequence[i], self.candidate_entity_sequence[i], self.agent.get_init_state_array(self.batch_size)[0], self.agent.get_init_state_array(self.batch_size)[1], self.params['prev_relation'], state['current_entities'], self.range_arr, 1.0, self.random_flag)
+                    loss_before_regularization.append(per_example_loss)
                     rel_string, ent_string = debate_printer.get_action_rel_ent(
-                        action_idx.cpu().numpy(),
-                        state
-                    )
-                    debate_printer.create_arguments(
-                        [rel_string], [ent_string],
-                        rewards.cpu().numpy(),
-                        False
-                    )
-            final_logits = self.judge(all_rewards)
-            debate_printer.set_debates_final_logit(final_logits.cpu().numpy())
+                        idx, state)
+                    debate_printer_rel_list.append(rel_string)
+                    debate_printer_ent_list.append(ent_string)
+                    state = episode(idx)
+                    i += 1
+                    logits.append((1, rewards))
 
-            # Calculate accuracy
-            predictions = (final_logits > 0).float()
-            accuracy = (predictions == episode_labels).float().mean()
+                debate_printer.create_arguments(
+                    debate_printer_rel_list, debate_printer_ent_list, rewards, False)
+                debate_printer_rel_list.clear()
+                debate_printer_ent_list.clear()
 
-            logger.info(f"Mean label: {episode_labels.float().mean()}")
-            logger.info(f"Accuracy: {accuracy.item()}")
+            logits_judge = self.judge(self.final_logits_judge)
+            debate_printer.set_debates_final_logit(logits_judge)
 
-            # Train judge or agents
             if is_train_judge:
-                judge_loss = F.binary_cross_entropy_with_logits(
-                    final_logits, episode_labels.float())
-                judge_loss.backward()
-                self.optimizer_judge.step()
-
-                logger.info(f"Judge Loss: {judge_loss.item()}")
+                self.train_judge
+                self.learning_rate_judge = self.learning_rate_judge_init
             else:
-                # Calculate rewards and REINFORCE loss
-                rewards_1, rewards_2 = episode.get_rewards(
-                    list(zip(which_agent_list, all_rewards)))
+                print("judge is NOT trained \n")
 
-                cum_discounted_reward_1, cum_discounted_reward_2 = self.calc_cum_discounted_reward(
-                    rewards_1.to(self.device),
-                    rewards_2.to(self.device),
-                    torch.tensor(which_agent_list, device=self.device)
-                )
+            predictions = logits_judge > 0
+            if self.batch_counter % self.params['save_debate_every'] == 0:
+                debate_printer.write(
+                    f'argument_train_{self.batch_counter}.txt')
 
-                # Update baselines
-                if not self.custom_baseline:
-                    self.baseline_1.update(
-                        cum_discounted_reward_1.mean().item())
-                    self.baseline_2.update(
-                        cum_discounted_reward_2.mean().item())
+            acc = predictions.float().mean()
+            logger.info(f"Mean label === {episode_answers.float().mean()}")
+            logger.info(f"Acc === {acc.item()}")
 
-                # Calculate agent losses
-                loss_1, loss_2 = self.calc_reinforce_loss(
-                    all_loss,
-                    which_agent_list,
-                    all_logits,
-                    cum_discounted_reward_1,
-                    cum_discounted_reward_2
-                )
+            rewards_1, rewards_2 = episode.get_rewards(logits)
+            logger.info(f"MEDIAN REWARD A1 === {rewards_1.mean().item()}")
+            logger.info(f"MEDIAN REWARD A2 === {rewards_2.mean().item()}")
 
-                total_loss = loss_1 + loss_2
-                total_loss.backward()
-                self.optimizer_agents.step()
+            self.train_op_1
+            self.train_op_2
 
-                logger.info(f"Agent 1 Loss: {loss_1.item()}")
-                logger.info(f"Agent 2 Loss: {loss_2.item()}")
+            if self.batch_counter == self.params['rounds_sub_training']:
+                torch.save(self.agent.state_dict(), os.path.join(
+                    self.params['model_dir'], 'unbiased_model.pt'))
+                torch.save(self.judge.state_dict(), os.path.join(
+                    self.params['model_dir'], 'unbiased_model.pt'))
 
-            # Save model and evaluate periodically
-            if self.batch_counter == self.rounds_sub_training:
-                self.save_model('unbiased_model')
+            if self.batch_counter % self.params['eval_every'] == 0:
+                self.test(True)
 
-            if self.batch_counter % self.eval_every == 0:
-                self.test(True)  # Test on dev set
-
-            # Memory management
-            if os.name == 'posix':
-                logger.info(
-                    f'Memory usage: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss} KB')
-
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            if self.batch_counter >= self.total_iterations:
+            if self.batch_counter >= self.params['total_iterations']:
                 break
 
-    def test(self, is_dev_environment: bool, save_model: bool = False, best_threshold: Optional[float] = None):
-        """
-        Test the model on dev or test set.
 
-        Args:
-            is_dev_environment: Whether to use dev or test environment
-            save_model: Whether to save the model
-            best_threshold: Optional threshold for binary classification
-        """
-        self.agent.eval()
-        self.judge.eval()
+def test(self, is_dev_environment, save_model=False, best_threshold=None):
+    batch_counter = 0
+    total_examples = 0
+    mean_probs_list = []
+    correct_answer_list = []
+    sk_mean_logit_list = []
+    sk_correct_answer_list = []
+    hitsAt20 = 0
+    hitsAt10 = 0
+    hitsAt3 = 0
+    hitsAt1 = 0
+    mean_reciprocal_rank = 0
+    mean_rank = 0
+    debate_printer = Debate_Printer(
+        self.params['output_dir'], self.train_environment.grapher, self.params['test_rollouts'], is_append=True)
 
-        batch_counter = 0
-        total_examples = 0
-        all_probs = []
-        all_labels = []
-        logits_list = []
-        correct_answer_list = []
+    environment = self.dev_test_environment if is_dev_environment else self.test_test_environment
+    for episode in tqdm(environment.get_episodes()):
+        batch_counter += 1
 
-        environment = self.dev_test_environment if is_dev_environment else self.test_test_environment
-        debate_printer = Debate_Printer(
-            self.output_dir, environment.grapher, self.test_rollouts, is_append=True)
+        episode_answers = episode.get_labels()
 
-        with torch.no_grad():
-            for episode in tqdm(environment.get_episodes()):
-                batch_counter += 1
-                temp_batch_size = episode.no_examples
+        self.query_subject.copy_(episode.get_query_subjects())
+        self.query_relation.copy_(episode.get_query_relation())
+        self.query_object.copy_(episode.get_query_objects())
+        self.labels.copy_(episode_answers)
 
-                # Process episode similar to training
-                query_subjects = episode.get_query_subjects().to(self.device)
-                query_relations = episode.get_query_relation().to(self.device)
-                query_objects = episode.get_query_objects().to(self.device)
-                episode_labels = episode.get_labels().to(self.device)
+        agent_mem_1, agent_mem_2 = self.agent.get_init_state_array(
+            episode.no_examples)
+        previous_relation = torch.ones(
+            episode.no_examples * self.params['test_rollouts'], dtype=torch.long) * self.params['relation_vocab']['DUMMY_START_RELATION']
 
-                # Initialize tracking variables
-                pro_memory = self.agent.get_init_state_array(temp_batch_size)[
-                    0].to(self.device)
-                con_memory = self.agent.get_init_state_array(temp_batch_size)[
-                    1].to(self.device)
+        debate_printer.create_debates(episode.get_query_subjects(
+        ), episode.get_query_relation(), episode.get_query_objects(), episode_answers)
 
-                debate_printer.create_debates(
-                    query_subjects.cpu().numpy(),
-                    query_relations.cpu().numpy(),
-                    query_objects.cpu().numpy(),
-                    episode_labels.cpu().numpy()
-                )
+        input_argument = 0
+        debate_printer_rel_list = []
+        debate_printer_ent_list = []
+        rep_argu_list = []  # Defined the list to store the hidden representations
+        for argument_num in range(self.params['number_arguments']):
+            state = episode.reset_initial_state()
+            for path_num in range(self.params['path_length']):
+                loss, agent_mem_1, agent_mem_2, test_scores, test_action_idx, chosen_relation, input_argument = self.agent(
+                    state['next_relations'], state['next_entities'], agent_mem_1, agent_mem_2, previous_relation, state['current_entities'], self.range_arr, 0.0, self.random_flag)
+                previous_relation = chosen_relation
+                rel_string, ent_string = debate_printer.get_action_rel_ent(
+                    test_action_idx, state)
+                debate_printer_rel_list.append(rel_string)
+                debate_printer_ent_list.append(ent_string)
+                state = episode(test_action_idx)
 
-                # Execute debate steps
-                for argument in range(self.number_arguments):
-                    # Similar structure to training loop but without backward pass
-                    state = episode.reset_initial_state()
+            logits_last_argument, hidden_rep_argu = self.judge(input_argument)
+            rewards = logits_last_argument
+            debate_printer.create_arguments(
+                debate_printer_rel_list, debate_printer_ent_list, rewards, True)
+            debate_printer_rel_list.clear()
+            debate_printer_ent_list.clear()
+            rep_argu_list.append(hidden_rep_argu)
 
-                    # Pro agent turn
-                    for path_num in range(self.path_length):
-                        next_relations = state['next_relations'].to(
-                            self.device)
-                        next_entities = state['next_entities'].to(self.device)
-                        current_entities = state['current_entities'].to(
-                            self.device)
+            mean_argu_rep = torch.mean(torch.stack(
+                [torch.unsqueeze(rep_argu, -1) for rep_argu in rep_argu_list], -1), -1)
+            logits_judge = self.judge(mean_argu_rep)
 
-                        _, pro_memory, con_memory, _, action_idx, rewards, _ = self.agent.step(
-                            next_relations,
-                            next_entities,
-                            pro_memory,
-                            con_memory,
-                            current_entities,
-                            which_agent=0.0,
-                            is_random=False
-                        )
+            reshaped_logits_judge = logits_judge.reshape(
+                episode.no_examples, self.params['test_rollouts'])
+            reshaped_answer = episode_answers.reshape(
+                episode.no_examples, self.params['test_rollouts'])
+            correct_answer_list.append(reshaped_answer[:, 0])
+            probs_judge = torch.sigmoid(reshaped_logits_judge)
+            mean_probs = torch.mean(probs_judge, dim=1, keepdim=True)
+            mean_probs_list.append(mean_probs)
+            reshaped_mean_probs = mean_probs.reshape(1, -1)
+            idx_final_logits = torch.argsort(
+                reshaped_mean_probs, dim=1, descending=True)
 
-                        state = episode(action_idx.cpu().numpy())
+            mean_logits = torch.mean(reshaped_logits_judge, dim=1)
+            sk_mean_logit_list.append(mean_logits)
+            sk_correct_answer_list.append(reshaped_answer[:, 0])
 
-                        rel_string, ent_string = debate_printer.get_action_rel_ent(
-                            action_idx.cpu().numpy(),
-                            state
-                        )
-                        debate_printer.create_arguments(
-                            [rel_string], [ent_string],
-                            rewards.cpu().numpy(),
-                            True
-                        )
+            debate_printer.create_best_debates()
+            debate_printer.set_debates_final_logit(mean_logits)
+            debate_printer.write('argument_test_new.txt')
 
-                    # Con agent turn
-                    state = episode.reset_initial_state()
-                    for path_num in range(self.path_length):
-                        # Similar process for con agent...
-                        next_relations = state['next_relations'].to(
-                            self.device)
-                        next_entities = state['next_entities'].to(self.device)
-                        current_entities = state['current_entities'].to(
-                            self.device)
+            for fact in idx_final_logits[0]:
+                ans_rank = None
+                rank = 0
+                for ix in reversed(idx_final_logits[0]):
+                    if ix == 0:
+                        ans_rank = rank
+                        break
+                    rank += 1
+                mean_reciprocal_rank += 1 / \
+                    (ans_rank+1) if ans_rank is not None else 0
+                mean_rank += ans_rank + \
+                    1 if ans_rank is not None else reshaped_mean_probs.size(
+                        1) + 1
+                if rank < 20:
+                    hitsAt20 += 1
+                    if rank < 10:
+                        hitsAt10 += 1
+                        if rank < 3:
+                            hitsAt3 += 1
+                            if rank == 0:
+                                hitsAt1 += 1
 
-                        _, pro_memory, con_memory, _, action_idx, rewards, _ = self.agent.step(
-                            next_relations,
-                            next_entities,
-                            pro_memory,
-                            con_memory,
-                            current_entities,
-                            which_agent=1.0,
-                            is_random=False
-                        )
+            total_examples += reshaped_mean_probs.size(1)
 
-                        state = episode(action_idx.cpu().numpy())
+        sk_correct_answer_list = torch.cat(
+            sk_correct_answer_list).to(torch.long)
+        sk_mean_logit_list = torch.cat(sk_mean_logit_list)
+        precision, recall, thresholds = self.get_precision_recall_curve(
+            sk_correct_answer_list, sk_mean_logit_list)
+        auc_pr = self.get_auc(recall, precision)
+        fpr, tpr, thresholds = self.get_roc_curve(
+            sk_correct_answer_list, sk_mean_logit_list)
+        auc_roc = self.get_auc(fpr, tpr)
 
-                        rel_string, ent_string = debate_printer.get_action_rel_ent(
-                            action_idx.cpu().numpy(),
-                            state
-                        )
-                        debate_printer.create_arguments(
-                            [rel_string], [ent_string],
-                            rewards.cpu().numpy(),
-                            False
-                        )
-
-                # Get final prediction
-                final_logits = self.judge(rewards).reshape(temp_batch_size, -1)
-                debate_printer.set_debates_final_logit(
-                    final_logits.cpu().numpy())
-
-                # Track metrics
-                logits_list.append(final_logits)
-                correct_answer_list.append(episode_labels)
-                all_probs.extend(torch.sigmoid(final_logits).cpu().numpy())
-                all_labels.extend(episode_labels.cpu().numpy())
-
-                total_examples += temp_batch_size
-
-        # Calculate metrics
-        all_logits = torch.cat(logits_list).cpu().numpy()
-        all_labels = np.array(all_labels)
-
-        # Calculate PR and ROC curves
-        precision, recall, thresholds = precision_recall_curve(
-            all_labels, all_probs)
-        auc_pr = auc(recall, precision)
-        fpr, tpr, thresholds = roc_curve(all_labels, all_probs)
-        auc_roc = auc(fpr, tpr)
-
-        # Find best threshold if not provided
+        best_acc = -1
         if best_threshold is None:
-            best_acc = 0
-            best_threshold = 0
             for threshold in thresholds:
-
-                preds = (all_probs > threshold).astype(int)
-                acc = accuracy_score(all_labels, preds)
-                if acc > best_acc:
+                binary_preds = (sk_mean_logit_list > threshold).to(torch.long)
+                acc = self.get_accuracy(binary_preds, sk_correct_answer_list)
+                if best_acc < acc:
                     best_acc = acc
                     best_threshold = threshold
         else:
-            preds = (all_probs > best_threshold).astype(int)
-            best_acc = accuracy_score(all_labels, preds)
+            for threshold in thresholds:
+                binary_preds = (sk_mean_logit_list > threshold).to(torch.long)
+                acc = self.get_accuracy(binary_preds, sk_correct_answer_list)
+                if best_acc < acc:
+                    best_acc = acc
+                    wrong_best_threshold = threshold
 
-        # Log metrics
-        logger.info("========== METRICS =============")
-        logger.info(f"Best Threshold: {best_threshold}")
-        logger.info(f"Accuracy: {best_acc}")
-        logger.info(f"AUC-PR: {auc_pr}")
-        logger.info(f"AUC-ROC: {auc_roc}")
-        logger.info("===============================")
+            logger.info(f"NOT BEST ACC === {best_acc}")
+            logger.info(f"NOT BEST THRESHOLD === {wrong_best_threshold}")
+            binary_preds = (sk_mean_logit_list > best_threshold).to(torch.long)
+            best_acc = self.get_accuracy(binary_preds, sk_correct_answer_list)
 
-        # Save model if improved
-        if self.is_use_fixed_false_facts:
-            if best_acc > self.best_metric:
-                self.save_model("model")
-            self.best_metric = max(best_acc, self.best_metric)
+        logger.info("========== SKLEARN METRICS =============")
+        logger.info(f"Best Threshold === {best_threshold}")
+        logger.info(f"Acc === {best_acc}")
+        logger.info(f"AUC_PR === {auc_pr}")
+        logger.info(f"AUC_ROC === {auc_roc}")
+        logger.info("========================================")
+
+        if self.params['is_use_fixed_false_facts']:
+            if save_model or best_acc > self.best_metric:
+                torch.save(self.agent.state_dict(), os.path.join(
+                    self.params['model_dir'], "model.pt"))
+                torch.save(self.judge.state_dict(), os.path.join(
+                    self.params['model_dir'], "model.pt"))
+            self.best_metric = best_acc if best_acc > self.best_metric else self.best_metric
             self.best_threshold = best_threshold
         else:
-            if auc_pr > self.best_metric:
-                self.save_model("model")
-            self.best_metric = max(auc_pr, self.best_metric)
+            if save_model or mean_reciprocal_rank > self.best_metric:
+                torch.save(self.agent.state_dict(), os.path.join(
+                    self.params['model_dir'], "model.pt"))
+                torch.save(self.judge.state_dict(), os.path.join(
+                    self.params['model_dir'], "model.pt"))
+            self.best_metric = mean_reciprocal_rank if mean_reciprocal_rank > self.best_metric else self.best_metric
 
-        # Reset to training mode
-        self.agent.train()
-        self.judge.train()
+        logger.info(f"Hits@20 === {hitsAt20 / total_examples}")
+        logger.info(f"Hits@10 === {hitsAt10 / total_examples}")
+        logger.info(f"Hits@3 === {hitsAt3 / total_examples}")
+        logger.info(f"Hits@1 === {hitsAt1 / total_examples}")
+        logger.info(f"MRR === {mean_reciprocal_rank / total_examples}")
+        logger.info(f"MR === {mean_rank / total_examples}")
 
         return best_threshold
 
-    def save_model(self, name: str):
-        """Save model checkpoint."""
-        save_path = os.path.join(self.model_dir, f"{name}.pt")
-        torch.save({
-            'judge_state_dict': self.judge.state_dict(),
-            'agent_state_dict': self.agent.state_dict(),
-            'optimizer_judge_state_dict': self.optimizer_judge.state_dict(),
-            'optimizer_agents_state_dict': self.optimizer_agents.state_dict(),
-            'best_metric': self.best_metric,
-            'best_threshold': self.best_threshold if hasattr(self, 'best_threshold') else None
-        }, save_path)
-        logger.info(f"Model saved to {save_path}")
+    def get_precision_recall_curve(self, y_true, y_score):
+        return sklearn.metrics.precision_recall_curve(y_true, y_score)
 
-    def load_model(self, path: str):
-        """Load model checkpoint."""
-        checkpoint = torch.load(path)
-        self.judge.load_state_dict(checkpoint['judge_state_dict'])
-        self.agent.load_state_dict(checkpoint['agent_state_dict'])
-        self.optimizer_judge.load_state_dict(
-            checkpoint['optimizer_judge_state_dict'])
-        self.optimizer_agents.load_state_dict(
-            checkpoint['optimizer_agents_state_dict'])
-        self.best_metric = checkpoint['best_metric']
-        if checkpoint['best_threshold'] is not None:
-            self.best_threshold = checkpoint['best_threshold']
-        logger.info(f"Model loaded from {path}")
+    def get_roc_curve(self, y_true, y_score):
+        return sklearn.metrics.roc_curve(y_true, y_score)
 
-    def calc_cum_discounted_reward(self, rewards_1: torch.Tensor, rewards_2: torch.Tensor,
-                                   which_agent_sequence: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Calculate cumulative discounted rewards for both agents.
+    def get_auc(self, x, y):
+        return sklearn.metrics.auc(x, y)
 
-        Args:
-            rewards_1: Rewards for agent 1
-            rewards_2: Rewards for agent 2
-            which_agent_sequence: Sequence indicating which agent took each action
-
-        Returns:
-            Tuple of cumulative discounted rewards for both agents
-        """
-        # Count actions per agent
-        num_actions_1 = (which_agent_sequence == 0).sum().item()
-        num_actions_2 = (which_agent_sequence == 1).sum().item()
-
-        # Initialize reward tensors
-        cum_disc_reward_1 = torch.zeros(
-            rewards_1.shape[0], num_actions_1, device=rewards_1.device)
-        cum_disc_reward_2 = torch.zeros(
-            rewards_2.shape[0], num_actions_2, device=rewards_2.device)
-
-        r_1_index = -1
-        r_2_index = -1
-        running_add_1 = torch.zeros(
-            rewards_1.shape[0], device=rewards_1.device)
-        running_add_2 = torch.zeros(
-            rewards_2.shape[0], device=rewards_2.device)
-        prev_agent = None
-
-        # Calculate discounted rewards in reverse
-        for t in reversed(range(len(which_agent_sequence))):
-            current_agent = which_agent_sequence[t].item()
-
-            if current_agent == 0:  # Agent 1
-                if prev_agent == 0:
-                    running_add_1 = self.gamma * \
-                        running_add_1 + rewards_1[:, r_1_index]
-                else:
-                    running_add_1 = rewards_1[:, r_1_index]
-                cum_disc_reward_1[:, r_1_index] = running_add_1
-                r_1_index -= 1
-            else:  # Agent 2
-                if prev_agent == 1:
-                    running_add_2 = self.gamma * \
-                        running_add_2 + rewards_2[:, r_2_index]
-                else:
-                    running_add_2 = rewards_2[:, r_2_index]
-                cum_disc_reward_2[:, r_2_index] = running_add_2
-                r_2_index -= 1
-
-            prev_agent = current_agent
-
-        return cum_disc_reward_1, cum_disc_reward_2
+    def get_accuracy(self, y_pred, y_true):
+        return sklearn.metrics.accuracy_score(y_true, y_pred)
 
 
 def main():
-    """Main training/testing function."""
-    options = read_options()
-
-    # Setup logging
+    option = read_options()
     logger.setLevel(logging.INFO)
-    formatter = logging.Formatter(
+    fmt = logging.Formatter(
         '%(asctime)s: [ %(message)s ]', '%m/%d/%Y %I:%M:%S %p')
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    logfile = None
+    logger.addHandler(console)
 
-    # Load vocabularies
-    logger.info('Reading vocabulary files...')
-    with open(os.path.join(options['vocab_dir'], 'relation_vocab.json'), 'r') as f:
-        relation_vocab = json.load(f)
-    with open(os.path.join(options['vocab_dir'], 'entity_vocab.json'), 'r') as f:
-        entity_vocab = json.load(f)
+    relation_vocab = json.load(
+        open(option['vocab_dir'] + '/relation_vocab.json'))
+    entity_vocab = json.load(open(option['vocab_dir'] + '/entity_vocab.json'))
+    mid_to_name = json.load(open(option['vocab_dir'] + '/fb15k_names.json')
+                            ) if os.path.isfile(option['vocab_dir'] + '/fb15k_names.json') else None
 
-    mid_to_name_path = os.path.join(options['vocab_dir'], 'fb15k_names.json')
-    mid_to_name = json.load(open(mid_to_name_path)) if os.path.exists(
-        mid_to_name_path) else None
+    logger.info(f'Total number of entities {len(entity_vocab)}')
+    logger.info(f'Total number of relations {len(relation_vocab)}')
 
-    logger.info(f'Total number of entities: {len(entity_vocab)}')
-    logger.info(f'Total number of relations: {len(relation_vocab)}')
+    if not option['load_model']:
+        for key, val in option.items():
+            if not isinstance(val, list):
+                option[key] = [val]
 
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available()
-                          and not options['no_cuda'] else 'cpu')
-    logger.info(f'Using device: {device}')
+        for permutation in ParameterGrid(option):
+            best_permutation = None
+            best_metric = 0
 
-    if not options['load_model']:
-        # Training mode
-        best_metric = 0
-        best_model = None
+            current_time = datetime.datetime.now()
+            current_time = current_time.strftime('%y_%b_%d__%H_%M_%S')
+            permutation['output_dir'] = permutation['base_output_dir'] + '/' + str(current_time) + '__' + str(uuid.uuid4())[:4] + '_' + str(
+                permutation['path_length']) + '_' + str(permutation['beta']) + '_' + str(permutation['test_rollouts']) + '_' + str(permutation['Lambda'])
+            permutation['model_dir'] = os.path.join(
+                permutation['output_dir'], 'model')
+            permutation['load_model'] = (permutation['load_model'] == 1)
 
-        # Create output directory
-        timestamp = datetime.datetime.now().strftime('%y_%b_%d__%H_%M_%S')
-        model_id = str(uuid.uuid4())[:4]
-        output_dir = os.path.join(
-            options['base_output_dir'],
-            f"{timestamp}__{model_id}_{options['path_length']}_{options['beta']}_{options['test_rollouts']}_{options['Lambda']}"
-        )
-        model_dir = os.path.join(output_dir, 'model')
-        os.makedirs(output_dir)
-        os.makedirs(model_dir)
+            os.makedirs(permutation['output_dir'])
+            os.mkdir(permutation['model_dir'])
+            with open(os.path.join(permutation['output_dir'], 'config.txt'), 'w') as out:
+                pprint(permutation, stream=out)
 
-        # Save configuration
-        options['output_dir'] = output_dir
-        options['model_dir'] = model_dir
-        options['relation_vocab'] = relation_vocab
-        options['entity_vocab'] = entity_vocab
-        options['mid_to_name'] = mid_to_name
-        options['device'] = device
+            print('Arguments:')
+            maxLen = max([len(ii) for ii in permutation.keys()])
+            fmtString = '\t%' + str(maxLen) + 's : %s'
+            for keyPair in sorted(permutation.items()):
+                print(fmtString % keyPair)
 
-        # with open(os.path.join(output_dir, 'config.json'), 'w') as f:
-        #     json.dump(options, f, indent=4)
+            logger.removeHandler(logfile)
+            logfile = logging.FileHandler(os.path.join(
+                permutation['output_dir'], 'log.txt'), 'w')
+            logfile.setFormatter(fmt)
+            logger.addHandler(logfile)
 
-        # Initialize trainer
-        for key, value in options.items():
+            permutation['relation_vocab'] = relation_vocab
+            permutation['entity_vocab'] = entity_vocab
+            permutation['mid_to_name'] = mid_to_name
+
+            trainer = Trainer(permutation, best_metric)
+            trainer.set_random_seeds(permutation.get('seed', None))
+            trainer.initialize()
+            trainer.train()
+
+            if trainer.best_metric > best_metric or best_permutation is None:
+                best_acc = trainer.best_metric
+                best_threshold = trainer.best_threshold
+                best_permutation = permutation
+            torch.cuda.empty_cache()
+
+        current_time = datetime.datetime.now()
+        current_time = current_time.strftime('%y_%b_%d__%H_%M_%S')
+        best_permutation['output_dir'] = best_permutation['base_output_dir'] + '/' + str(current_time) + '__Test__' + str(uuid.uuid4())[:4] + '_' + str(
+            best_permutation['path_length']) + '_' + str(best_permutation['beta']) + '_' + str(best_permutation['test_rollouts']) + '_' + str(best_permutation['Lambda'])
+        best_permutation['old_model_dir'] = best_permutation['model_dir']
+        best_permutation['model_dir'] = os.path.join(
+            best_permutation['output_dir'], 'model')
+        best_permutation['load_model'] = (best_permutation['load_model'] == 1)
+
+        os.makedirs(best_permutation['output_dir'])
+        os.mkdir(best_permutation['model_dir'])
+        with open(os.path.join(best_permutation['output_dir'], 'config.txt'), 'w') as out:
+            pprint(best_permutation, stream=out)
+
+        print('Arguments:')
+        maxLen = max([len(ii) for ii in best_permutation.keys()])
+        fmtString = '\t%' + str(maxLen) + 's : %s'
+        for keyPair in sorted(best_permutation.items()):
+            if not keyPair[0].endswith('_vocab') and keyPair[0] != 'mid_to_name':
+                print(fmtString % keyPair)
+
+        logger.removeHandler(logfile)
+        logfile = logging.FileHandler(os.path.join(
+            best_permutation['output_dir'], 'log.txt'), 'w')
+        logfile.setFormatter(fmt)
+        logger.addHandler(logfile)
+
+        trainer = Trainer(best_permutation, best_acc)
+        trainer.set_random_seeds(best_permutation.get('seed', None))
+        trainer.initialize(os.path.join(
+            best_permutation['old_model_dir'], "model.pt"))
+        trainer.test(False, True, best_threshold)
+    else:
+        logger.info("Skipping training")
+        logger.info(f"Loading model from {option['model_load_dir']}")
+
+        for key, value in option.items():
             if isinstance(value, list):
-                options[key] = value[0]
-        trainer = Trainer(options, best_metric)
-        # trainer.to(device)
+                if len(value) == 1:
+                    option[key] = value[0]
+                else:
+                    raise ValueError(
+                        f"Parameter {key} has more than one value in the config file.")
 
-        # Train model
-        trainer.train()
+        current_time = datetime.datetime.now()
+        current_time = current_time.strftime('%y_%b_%d__%H_%M_%S')
+        option['output_dir'] = option['base_output_dir'] + '/' + str(current_time) + '__Test__' + str(uuid.uuid4())[:4] + '_' + str(
+            option['path_length']) + '_' + str(option['beta']) + '_' + str(option['test_rollouts']) + '_' + str(option['Lambda'])
+        option['model_dir'] = os.path.join(option['output_dir'], 'model')
+        os.makedirs(option['output_dir'])
+        os.mkdir(option['model_dir'])
+        with open(os.path.join(option['output_dir'], 'config.txt'), 'w') as out:
+            pprint(option, stream=out)
 
-        # Test best model
-        if options['is_use_fixed_false_facts']:
-            trainer.test(False, True, trainer.best_threshold)
+        logger.removeHandler(logfile)
+        logfile = logging.FileHandler(os.path.join(
+            option['output_dir'], 'log.txt'), 'w')
+        logfile.setFormatter(fmt)
+        logger.addHandler(logfile)
+
+        option['relation_vocab'] = relation_vocab
+        option['entity_vocab'] = entity_vocab
+        option['mid_to_name'] = mid_to_name
+
+        trainer = Trainer(option, 0)
+        trainer.set_random_seeds(option.get('seed', None))
+        trainer.initialize(option['model_load_dir'] + "model.pt")
+        if option['is_use_fixed_false_facts']:
+            best_threshold = trainer.test(True, False)
+            trainer.test(False, True, best_threshold=best_threshold)
         else:
             trainer.test(False, True)
-    else:
-        # Testing mode
-        logger.info(f"Loading model from {options['model_load_dir']}")
-
-        # Create output directory for test results
-        timestamp = datetime.datetime.now().strftime('%y_%b_%d__%H_%M_%S')
-        output_dir = os.path.join(
-            options['base_output_dir'],
-            f"{timestamp}__Test__{options['path_length']}_{options['beta']}_{options['test_rollouts']}_{options['Lambda']}"
-        )
-        model_dir = os.path.join(output_dir, 'model')
-        os.makedirs(output_dir)
-        os.makedirs(model_dir)
-
-        # Save test configuration
-        options['output_dir'] = output_dir
-        options['model_dir'] = model_dir
-        options['relation_vocab'] = relation_vocab
-        options['entity_vocab'] = entity_vocab
-        options['mid_to_name'] = mid_to_name
-
-        with open(os.path.join(output_dir, 'config.json'), 'w') as f:
-            json.dump(options, f, indent=4)
-
-        # Initialize trainer and load model
-        trainer = Trainer(options, 0)
-        trainer.to(device)
-        trainer.load_model(os.path.join(options['model_load_dir'], 'model.pt'))
-
-        # Run tests
-        if options['is_use_fixed_false_facts']:
-            best_threshold = trainer.test(True, False)  # Dev set
-            trainer.test(False, True, best_threshold)  # Test set
-        else:
-            trainer.test(False, True)  # Test set
 
 
 if __name__ == '__main__':
