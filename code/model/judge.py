@@ -22,7 +22,7 @@ class Judge(nn.Module):
         self.path_length = params['path_length']
         self.train_relations = params['train_relation_embeddings']
         self.train_entities = params['train_entity_embeddings']
-
+        
         # Create embeddings
         self.relation_embeddings = nn.Embedding(
             self.action_vocab_size, self.embedding_size)
