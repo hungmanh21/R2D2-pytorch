@@ -686,7 +686,9 @@ def main():
             json.dump(options, f, indent=4)
 
         # Initialize trainer
-        print("OPTIONS", options)
+        for key, value in options.items():
+            if isinstance(value, list):
+                options[key] = value[0]
         trainer = Trainer(options, best_metric)
         trainer.to(device)
 
